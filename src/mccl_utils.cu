@@ -2,7 +2,7 @@
  * Adapted from SwiftTransformer(https://github.com/LLMServe/SwiftTransformer/blob/main/src/csrc/util/py_nccl.cc)
  **************************************************************************************************/
 
-#include "nccl_utils.h"
+#include "mccl_utils.h"
 
 std::vector<int64_t> generate_mccl_id() {
     mcclUniqueId mccl_id;

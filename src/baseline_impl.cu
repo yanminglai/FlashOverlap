@@ -1,4 +1,4 @@
-#include "nccl_utils.h"
+#include "mccl_utils.h"
 #include <cuda.h>
 #include <cuda_runtime.h>
 #include <cuda_fp16.h>
@@ -13,7 +13,7 @@
 #define DIV_UP(x, y) (((x) + (y) - 1) / (y))
 #define MAX_GROUP_SIZE 16
 
-/// Baseline Implementation: cuBLAS for GEMM and NCCL for AllReduce
+/// Baseline Implementation: cuBLAS for GEMM and MCCL for AllReduce
 BaselineImpl::BaselineImpl(){
     cublasCreate(&this->my_handle);
     this->my_rank = 0;
@@ -22,12 +22,12 @@ BaselineImpl::BaselineImpl(){
 
 BaselineImpl::~BaselineImpl(){
     cublasDestroy(this->my_handle);
-    // ncclCommDestroy(this->comm);
+    // mcclCommDestroy(this->comm);
 }
 
 void BaselineImpl::GemmAllReduce(at::Tensor A, at::Tensor B, at::Tensor C){
 
-    // Check if NCCL is initilized
+    // Check if MCCL is initialized
     if (this->comm == nullptr) {
         return;
     }
@@ -41,7 +41,7 @@ void BaselineImpl::GemmAllReduce(at::Tensor A, at::Tensor B, at::Tensor C){
     half alpha_half = __float2half(alpha);
     half beta_half = __float2half(beta);
 
-    // prepare for NCCL
+    // prepare for MCCL
     half* c_ptr = reinterpret_cast<half *>(C.data_ptr<at::Half>());
 
     // Launch GEMM
@@ -59,7 +59,7 @@ void BaselineImpl::GemmAllReduce(at::Tensor A, at::Tensor B, at::Tensor C){
                     CUBLAS_GEMM_DEFAULT_TENSOR_OP);
 
     // Launch AllReduce after GEMM
-    NCCL_CHECK(ncclAllReduce((void *)c_ptr, (void *)c_ptr, (M * N), ncclFloat16, ncclSum, this->comm, this->my_stream));
+    MCCL_CHECK(mcclAllReduce((void *)c_ptr, (void *)c_ptr, (M * N), mcclFloat16, mcclSum, this->comm, this->my_stream));
 }
 
 void BaselineImpl::GemmReduceScatter(
@@ -69,7 +69,7 @@ void BaselineImpl::GemmReduceScatter(
         at::Tensor D  // [M / world_size, N]
         ){
 
-    // Check if NCCL is initilized
+    // Check if MCCL is initialized
     if (this->comm == nullptr) {
         return;
     }
@@ -83,7 +83,7 @@ void BaselineImpl::GemmReduceScatter(
     half alpha_half = __float2half(alpha);
     half beta_half = __float2half(beta);
 
-    // prepare for NCCL
+    // prepare for MCCL
     half* c_ptr = reinterpret_cast<half *>(C.data_ptr<at::Half>());
     half* d_ptr = reinterpret_cast<half *>(D.data_ptr<at::Half>());
 
@@ -101,16 +101,16 @@ void BaselineImpl::GemmReduceScatter(
                     CUBLAS_COMPUTE_16F,
                     CUBLAS_GEMM_DEFAULT_TENSOR_OP);
 
-    // Launch AllReduce after GEMM
+    // Launch ReduceScatter after GEMM
     size_t recvcount = (M * N) / this->my_size;
-    NCCL_CHECK(ncclReduceScatter((void *)c_ptr, (void *)d_ptr, recvcount, 
-        ncclFloat16, ncclSum, this->comm, this->my_stream));
+    MCCL_CHECK(mcclReduceScatter((void *)c_ptr, (void *)d_ptr, recvcount, 
+        mcclFloat16, mcclSum, this->comm, this->my_stream));
 }
 
 void BaselineImpl::GemmAll2All(at::Tensor A, at::Tensor B, at::Tensor C,
     at::Tensor D, at::Tensor mLen_CPU){
 
-    // Check if NCCL is initilized
+    // Check if MCCL is initialized
     if (this->comm == nullptr) {
         return;
     }
@@ -129,7 +129,7 @@ void BaselineImpl::GemmAll2All(at::Tensor A, at::Tensor B, at::Tensor C,
     half alpha_half = __float2half(alpha);
     half beta_half = __float2half(beta);
 
-    // prepare for NCCL
+    // prepare for MCCL
     half* c_ptr = reinterpret_cast<half *>(C.data_ptr<at::Half>());
     half* d_ptr = reinterpret_cast<half *>(D.data_ptr<at::Half>());
 
@@ -152,33 +152,33 @@ void BaselineImpl::GemmAll2All(at::Tensor A, at::Tensor B, at::Tensor C,
     int src_acc_addr = 0;
     // Then RECV
     int dst_acc_addr = 0;
-    NCCL_CHECK(ncclGroupStart());
+    MCCL_CHECK(mcclGroupStart());
     for (int i = 0; i < this->my_size; i++){
         if (i == this->my_rank){continue;}
         size_t sendcount = mlen_cpu_ptr[this->my_rank * this->my_size + i] * N;
-        NCCL_CHECK(ncclSend((void *)(c_ptr + src_acc_addr), sendcount, ncclFloat16, i, this->comm, this->my_stream));
+        MCCL_CHECK(mcclSend((void *)(c_ptr + src_acc_addr), sendcount, mcclFloat16, i, this->comm, this->my_stream));
         src_acc_addr += sendcount;
 
         size_t recvcount = mlen_cpu_ptr[i * this->my_size + this->my_rank] * N;
-        NCCL_CHECK(ncclRecv((void *)(d_ptr + dst_acc_addr), recvcount, ncclFloat16, i, this->comm, this->my_stream));
+        MCCL_CHECK(mcclRecv((void *)(d_ptr + dst_acc_addr), recvcount, mcclFloat16, i, this->comm, this->my_stream));
         dst_acc_addr += recvcount;
     }
-    NCCL_CHECK(ncclGroupEnd());
+    MCCL_CHECK(mcclGroupEnd());
 }
 
-void BaselineImpl::NcclInit(const int64_t tp_rank, const int64_t tp_size, const std::vector<int64_t> tp_id)
+void BaselineImpl::McclInit(const int64_t tp_rank, const int64_t tp_size, const std::vector<int64_t> tp_id)
 {
     this->my_rank = tp_rank;
     this->my_size = tp_size;
     
-    ncclUniqueId tp_uid;
-    memcpy(tp_uid.internal, &tp_id[0], NCCL_UNIQUE_ID_BYTES);
+    mcclUniqueId tp_uid;
+    memcpy(tp_uid.internal, &tp_id[0], MCCL_UNIQUE_ID_BYTES);
 
     if (this->my_size == 1) {
         this->comm = nullptr;
         return;
     }
-    NCCL_CHECK(ncclCommInitRank(&this->comm, this->my_size, tp_uid, this->my_rank));
+    MCCL_CHECK(mcclCommInitRank(&this->comm, this->my_size, tp_uid, this->my_rank));
 }
 
 void BaselineImpl::CublasInit(){
@@ -217,17 +217,17 @@ void BaselineImpl::Gemm(at::Tensor A, at::Tensor B, at::Tensor C){
                     CUBLAS_GEMM_DEFAULT_TENSOR_OP);
 }
 
-void BaselineImpl::NcclAllReduce(at::Tensor C){
+void BaselineImpl::McclAllReduce(at::Tensor C){
 
     int M = C.size(0);
     int N = C.size(1);
 
     half* c_ptr = reinterpret_cast<half *>(C.data_ptr<at::Half>());
 
-    ncclAllReduce((void *)c_ptr, (void *)c_ptr, (M * N), ncclFloat16, ncclSum, this->comm, this->my_stream);
+    mcclAllReduce((void *)c_ptr, (void *)c_ptr, (M * N), mcclFloat16, mcclSum, this->comm, this->my_stream);
 }
 
-void BaselineImpl::NcclReduceScatter(at::Tensor C){
+void BaselineImpl::McclReduceScatter(at::Tensor C){
 
     int M = C.size(0);
     int N = C.size(1);
@@ -235,11 +235,11 @@ void BaselineImpl::NcclReduceScatter(at::Tensor C){
     half* c_ptr = reinterpret_cast<half *>(C.data_ptr<at::Half>());
 
     size_t recvcount = (M * N) / this->my_size;
-    NCCL_CHECK(ncclReduceScatter((void *)c_ptr, (void *)(c_ptr + this->my_rank * recvcount), recvcount, 
-        ncclFloat16, ncclSum, this->comm, this->my_stream));
+    MCCL_CHECK(mcclReduceScatter((void *)c_ptr, (void *)(c_ptr + this->my_rank * recvcount), recvcount, 
+        mcclFloat16, mcclSum, this->comm, this->my_stream));
 }
 
-void BaselineImpl::NcclAll2All(at::Tensor C, 
+void BaselineImpl::McclAll2All(at::Tensor C, 
     at::Tensor D, // [world_size - 1, M, N]
     at::Tensor mLen_CPU // [world_size, world_size]
     ){
@@ -258,16 +258,16 @@ void BaselineImpl::NcclAll2All(at::Tensor C,
     int src_acc_addr = 0;
     // Then RECV
     int dst_acc_addr = 0;
-    NCCL_CHECK(ncclGroupStart());
+    MCCL_CHECK(mcclGroupStart());
     for (int i = 0; i < this->my_size; i++){
         if (i == this->my_rank){continue;}
         size_t sendcount = mlen_cpu_ptr[this->my_rank * this->my_size + i] * N;
-        NCCL_CHECK(ncclSend((void *)(c_ptr + src_acc_addr), sendcount, ncclFloat16, i, this->comm, this->my_stream));
+        MCCL_CHECK(mcclSend((void *)(c_ptr + src_acc_addr), sendcount, mcclFloat16, i, this->comm, this->my_stream));
         src_acc_addr += sendcount;
 
         size_t recvcount = mlen_cpu_ptr[i * this->my_size + this->my_rank] * N;
-        NCCL_CHECK(ncclRecv((void *)(d_ptr + dst_acc_addr), recvcount, ncclFloat16, i, this->comm, this->my_stream));
+        MCCL_CHECK(mcclRecv((void *)(d_ptr + dst_acc_addr), recvcount, mcclFloat16, i, this->comm, this->my_stream));
         dst_acc_addr += recvcount;
     }
-    NCCL_CHECK(ncclGroupEnd());
+    MCCL_CHECK(mcclGroupEnd());
 }

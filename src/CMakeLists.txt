@@ -43,9 +43,9 @@ add_library(overlap_impl overlap_impl.cu)
 set_property(TARGET overlap_impl PROPERTY POSITION_INDEPENDENT_CODE ON)
 target_link_libraries (overlap_impl PUBLIC gemm overlap norm)
 
-# ====== MCCL utilities (renamed from nccl_tool) ======
-set_musa_source_properties(nccl_utils.cu)
-add_library(mccl_tool nccl_utils.cu)
+# ====== MCCL utilities ======
+set_musa_source_properties(mccl_utils.cu)
+add_library(mccl_tool mccl_utils.cu)
 set_property(TARGET mccl_tool PROPERTY POSITION_INDEPENDENT_CODE ON)
 
 # ====== Python binding shared library ======

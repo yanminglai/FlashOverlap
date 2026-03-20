@@ -1,6 +1,6 @@
 #include "baseline_impl.h"
 #include "overlap_impl.h"
-#include "nccl_utils.h"
+#include "mccl_utils.h"
 #include "rmsnorm/rmsnorm.h"
 
 #include <torch/script.h>
@@ -8,9 +8,9 @@
 #include <torch/serialize/tensor.h>
 
 template<typename T>
-void NcclInitWrapper(const c10::intrusive_ptr<T>& self, 
+void McclInitWrapper(const c10::intrusive_ptr<T>& self, 
     const int64_t tp_rank, const int64_t tp_size, const std::vector<int64_t> tp_id){
-    self->NcclInit(tp_rank, tp_size, tp_id);
+    self->McclInit(tp_rank, tp_size, tp_id);
 }
 
 template<typename T>
@@ -91,8 +91,8 @@ void ReduceScatterOverlapWrapper(const c10::intrusive_ptr<T>& self,
 }
 
 template<typename T>
-void NcclAllReduceWrapper(const c10::intrusive_ptr<T>& self, at::Tensor C){
-    self->NcclAllReduce(C);
+void McclAllReduceWrapper(const c10::intrusive_ptr<T>& self, at::Tensor C){
+    self->McclAllReduce(C);
 }
 
 template<typename T>
@@ -102,13 +102,13 @@ void SegAllReduceWrapper(const c10::intrusive_ptr<T>& self, at::Tensor C,
 }
 
 template<typename T>
-void NcclReduceScatterWrapper(const c10::intrusive_ptr<T>& self, at::Tensor C){
-    self->NcclReduceScatter(C);
+void McclReduceScatterWrapper(const c10::intrusive_ptr<T>& self, at::Tensor C){
+    self->McclReduceScatter(C);
 }
 
 template<typename T>
-void NcclAll2AllWrapper(const c10::intrusive_ptr<T>& self, at::Tensor C, at::Tensor D, at::Tensor mLen_CPU){
-    self->NcclAll2All(C, D, mLen_CPU);
+void McclAll2AllWrapper(const c10::intrusive_ptr<T>& self, at::Tensor C, at::Tensor D, at::Tensor mLen_CPU){
+    self->McclAll2All(C, D, mLen_CPU);
 }
 
 TORCH_LIBRARY(flashoverlap_class, m) {
@@ -116,15 +116,15 @@ TORCH_LIBRARY(flashoverlap_class, m) {
     // Class
     m.class_<BaselineImpl>("BaselineImpl")
         .def(torch::init())
-        .def("nccl_init", &NcclInitWrapper<BaselineImpl>)
+        .def("mccl_init", &McclInitWrapper<BaselineImpl>)
         .def("cublas_init", &CublasInitWrapper<BaselineImpl>)
         .def("gemm_allreduce", &GemmAllReduceWrapper<BaselineImpl>)
         .def("gemm_reducescatter", &GemmReduceScatterWrapper<BaselineImpl>)
         .def("gemm_all2all", &GemmAll2AllWrapper<BaselineImpl>)
         .def("cublas_gemm", &GemmWrapper<BaselineImpl>)
-        .def("nccl_allreduce", &NcclAllReduceWrapper<BaselineImpl>)
-        .def("nccl_reducescatter", &NcclReduceScatterWrapper<BaselineImpl>)
-        .def("nccl_all2all", &NcclAll2AllWrapper<BaselineImpl>)
+        .def("mccl_allreduce", &McclAllReduceWrapper<BaselineImpl>)
+        .def("mccl_reducescatter", &McclReduceScatterWrapper<BaselineImpl>)
+        .def("mccl_all2all", &McclAll2AllWrapper<BaselineImpl>)
     ;
     m.class_<OverlapImpl>("OverlapImpl")
         .def(torch::init())
@@ -132,19 +132,19 @@ TORCH_LIBRARY(flashoverlap_class, m) {
         .def("cutlass_gemm", &CutlassGemmWrapper<OverlapImpl>)
         .def("gemm_allreduce_overlap", &AllReduceOverlapWrapper<OverlapImpl>)
         .def("gemm_reducescatter_overlap", &ReduceScatterOverlapWrapper<OverlapImpl>)
-        .def("nccl_init", &NcclInitWrapper<OverlapImpl>)
+        .def("mccl_init", &McclInitWrapper<OverlapImpl>)
         .def("gemm_allreduce", &CutlassGemmAllReduceWrapper<OverlapImpl>)
         .def("gemm_reducescatter", &CutlassGemmReduceScatterWrapper<OverlapImpl>)
         .def("gemm_all2all", &CutlassAll2AllWrapper<OverlapImpl>)
         .def("overlap_init", &OverlapInitWrapper<OverlapImpl>)
-        .def("nccl_allreduce", &NcclAllReduceWrapper<OverlapImpl>)
-        .def("nccl_reducescatter", &NcclReduceScatterWrapper<OverlapImpl>)
-        .def("nccl_all2all", &NcclAll2AllWrapper<OverlapImpl>)
+        .def("mccl_allreduce", &McclAllReduceWrapper<OverlapImpl>)
+        .def("mccl_reducescatter", &McclReduceScatterWrapper<OverlapImpl>)
+        .def("mccl_all2all", &McclAll2AllWrapper<OverlapImpl>)
         .def("seg_allreduce", &SegAllReduceWrapper<OverlapImpl>)
     ;
 }
 
 TORCH_LIBRARY(flashoverlap_op, m) {
-    m.def("generate_nccl_id", &generate_nccl_id);
+    m.def("generate_mccl_id", &generate_mccl_id);
     m.def("reorder_rmsnorm", &reorder_rmsnorm);
 }

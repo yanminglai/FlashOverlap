@@ -1,4 +1,4 @@
-#include "nccl_utils.h"
+#include "mccl_utils.h"
 #include "wait.cuh"
 
 #include "tiling/gemm_tiling.cuh"
@@ -19,7 +19,7 @@
 #define DIV_UP(x, y) (((x) + (y) - 1) / (y))
 #define MAX_GROUP_SIZE 64
 
-/// NIL Implementation: Overlap CUTLASS GEMM and NCCL AllReduce
+/// NIL Implementation: Overlap CUTLASS GEMM and MCCL AllReduce
 OverlapImpl::OverlapImpl(){
 
 }
@@ -47,19 +47,19 @@ void OverlapImpl::Gemm(at::Tensor A, at::Tensor B, at::Tensor C, int64_t Algo){
     );
 }
 
-void OverlapImpl::NcclInit(const int64_t tp_rank, const int64_t tp_size, const std::vector<int64_t> tp_id){
+void OverlapImpl::McclInit(const int64_t tp_rank, const int64_t tp_size, const std::vector<int64_t> tp_id){
 
     this->my_rank = tp_rank;
     this->my_size = tp_size;
 
-    ncclUniqueId tp_uid;
-    memcpy(tp_uid.internal, &tp_id[0], NCCL_UNIQUE_ID_BYTES);
+    mcclUniqueId tp_uid;
+    memcpy(tp_uid.internal, &tp_id[0], MCCL_UNIQUE_ID_BYTES);
 
     if (this->my_size == 1) {
         this->comm = nullptr;
         return;
     }
-    NCCL_CHECK(ncclCommInitRank(&this->comm, this->my_size, tp_uid, this->my_rank));
+    MCCL_CHECK(mcclCommInitRank(&this->comm, this->my_size, tp_uid, this->my_rank));
 }
 
 void OverlapImpl::GemmAllReduce(at::Tensor A, at::Tensor B, at::Tensor C, int64_t Algo){
@@ -76,7 +76,7 @@ void OverlapImpl::GemmAllReduce(at::Tensor A, at::Tensor B, at::Tensor C, int64_
         M, N, K, a_ptr, b_ptr, c_ptr, this->gemm_stream
     );
 
-    NCCL_CHECK(ncclAllReduce((void *)c_ptr, (void *)c_ptr, (M * N), ncclFloat16, ncclSum, this->comm, this->gemm_stream));
+    MCCL_CHECK(mcclAllReduce((void *)c_ptr, (void *)c_ptr, (M * N), mcclFloat16, mcclSum, this->comm, this->gemm_stream));
 }
 
 void OverlapImpl::GemmReduceScatter(
@@ -96,8 +96,8 @@ void OverlapImpl::GemmReduceScatter(
     );
 
     size_t recvcount = (M * N) / this->my_size;
-    NCCL_CHECK(ncclReduceScatter((void *)c_ptr, (void *)d_ptr, recvcount, 
-        ncclFloat16, ncclSum, this->comm, this->gemm_stream));
+    MCCL_CHECK(mcclReduceScatter((void *)c_ptr, (void *)d_ptr, recvcount, 
+        mcclFloat16, mcclSum, this->comm, this->gemm_stream));
 }
 
 void OverlapImpl::GemmAll2All(at::Tensor A, at::Tensor B, at::Tensor C, at::Tensor D, 
@@ -122,32 +122,32 @@ void OverlapImpl::GemmAll2All(at::Tensor A, at::Tensor B, at::Tensor C, at::Tens
     int src_acc_addr = 0;
     // Then RECV
     int dst_acc_addr = 0;
-    NCCL_CHECK(ncclGroupStart());
+    MCCL_CHECK(mcclGroupStart());
     for (int i = 0; i < this->my_size; i++){
         if (i == this->my_rank){continue;}
         size_t sendcount = mlen_cpu_ptr[this->my_rank * this->my_size + i] * N;
-        NCCL_CHECK(ncclSend((void *)(c_ptr + src_acc_addr), sendcount, ncclFloat16, i, this->comm, this->gemm_stream));
+        MCCL_CHECK(mcclSend((void *)(c_ptr + src_acc_addr), sendcount, mcclFloat16, i, this->comm, this->gemm_stream));
         src_acc_addr += sendcount;
 
         size_t recvcount = mlen_cpu_ptr[i * this->my_size + this->my_rank] * N;
-        NCCL_CHECK(ncclRecv((void *)(d_ptr + dst_acc_addr), recvcount, ncclFloat16, i, this->comm, this->gemm_stream));
+        MCCL_CHECK(mcclRecv((void *)(d_ptr + dst_acc_addr), recvcount, mcclFloat16, i, this->comm, this->gemm_stream));
         dst_acc_addr += recvcount;
     }
-    NCCL_CHECK(ncclGroupEnd());
+    MCCL_CHECK(mcclGroupEnd());
 }
 
 void OverlapImpl::OverlapInit(){
     cudaStreamCreateWithPriority(&this->comm_stream, cudaStreamNonBlocking, -5);
 }
 
-void OverlapImpl::NcclAllReduce(at::Tensor C){
+void OverlapImpl::McclAllReduce(at::Tensor C){
 
     int M = C.size(0);
     int N = C.size(1);
 
     half* c_ptr = reinterpret_cast<half *>(C.data_ptr<at::Half>());
 
-    ncclAllReduce((void *)c_ptr, (void *)c_ptr, (M * N), ncclFloat16, ncclSum, this->comm, this->gemm_stream);
+    mcclAllReduce((void *)c_ptr, (void *)c_ptr, (M * N), mcclFloat16, mcclSum, this->comm, this->gemm_stream);
 }
 
 void OverlapImpl::SegAllReduce(at::Tensor C, at::Tensor cSEG_CPU, int64_t SegNum){
@@ -161,12 +161,12 @@ void OverlapImpl::SegAllReduce(at::Tensor C, at::Tensor cSEG_CPU, int64_t SegNum
     int acc_addr = 0;
     for (int s = 0; s < SegNum; s++){
         int commSize = M * N / SegNum * cseg_cpu_ptr[s];
-        NCCL_CHECK(ncclAllReduce((void *)(c_ptr + acc_addr), (void *)(c_ptr + acc_addr), commSize, ncclFloat16, ncclSum, this->comm, this->gemm_stream));
+        MCCL_CHECK(mcclAllReduce((void *)(c_ptr + acc_addr), (void *)(c_ptr + acc_addr), commSize, mcclFloat16, mcclSum, this->comm, this->gemm_stream));
         acc_addr += commSize;
     }
 }
 
-void OverlapImpl::NcclReduceScatter(at::Tensor C){
+void OverlapImpl::McclReduceScatter(at::Tensor C){
 
     int M = C.size(0);
     int N = C.size(1);
@@ -174,11 +174,11 @@ void OverlapImpl::NcclReduceScatter(at::Tensor C){
     half* c_ptr = reinterpret_cast<half *>(C.data_ptr<at::Half>());
 
     size_t recvcount = (M * N) / this->my_size;
-    NCCL_CHECK(ncclReduceScatter((void *)c_ptr, (void *)(c_ptr + this->my_rank * recvcount), recvcount, 
-        ncclFloat16, ncclSum, this->comm, this->gemm_stream));
+    MCCL_CHECK(mcclReduceScatter((void *)c_ptr, (void *)(c_ptr + this->my_rank * recvcount), recvcount, 
+        mcclFloat16, mcclSum, this->comm, this->gemm_stream));
 }
 
-void OverlapImpl::NcclAll2All(at::Tensor C, 
+void OverlapImpl::McclAll2All(at::Tensor C, 
     at::Tensor D, // [world_size - 1, M, N]
     at::Tensor mLen_CPU // [world_size, world_size]
     ){
@@ -197,18 +197,18 @@ void OverlapImpl::NcclAll2All(at::Tensor C,
     int src_acc_addr = 0;
     // Then RECV
     int dst_acc_addr = 0;
-    NCCL_CHECK(ncclGroupStart());
+    MCCL_CHECK(mcclGroupStart());
     for (int i = 0; i < this->my_size; i++){
         if (i == this->my_rank){continue;}
         size_t sendcount = mlen_cpu_ptr[this->my_rank * this->my_size + i] * N;
-        NCCL_CHECK(ncclSend((void *)(c_ptr + src_acc_addr), sendcount, ncclFloat16, i, this->comm, this->gemm_stream));
+        MCCL_CHECK(mcclSend((void *)(c_ptr + src_acc_addr), sendcount, mcclFloat16, i, this->comm, this->gemm_stream));
         src_acc_addr += sendcount;
 
         size_t recvcount = mlen_cpu_ptr[i * this->my_size + this->my_rank] * N;
-        NCCL_CHECK(ncclRecv((void *)(d_ptr + dst_acc_addr), recvcount, ncclFloat16, i, this->comm, this->gemm_stream));
+        MCCL_CHECK(mcclRecv((void *)(d_ptr + dst_acc_addr), recvcount, mcclFloat16, i, this->comm, this->gemm_stream));
         dst_acc_addr += recvcount;
     }
-    NCCL_CHECK(ncclGroupEnd());
+    MCCL_CHECK(mcclGroupEnd());
 }
 
 void OverlapImpl::GemmAllReduceOverlap(
@@ -253,7 +253,7 @@ void OverlapImpl::GemmAllReduceOverlap(
         // The signal is reset by the wait kernel
         kernel_wait_flag<<<1, 1, 0, this->comm_stream>>> (this_seg, (mm_ptr + iter));
         // Communicate the data
-        NCCL_CHECK(ncclAllReduce((void *)(c_ptr + acc_addr), (void *)(c_ptr + acc_addr), commSize, ncclFloat16, ncclSum, this->comm, this->comm_stream));
+        MCCL_CHECK(mcclAllReduce((void *)(c_ptr + acc_addr), (void *)(c_ptr + acc_addr), commSize, mcclFloat16, mcclSum, this->comm, this->comm_stream));
         acc_addr += commSize;
     }
 
@@ -309,8 +309,8 @@ void OverlapImpl::GemmReduceScatterOverlap(
         // The signal is reset by the wait kernel
         kernel_wait_flag<<<1, 1, 0, this->comm_stream>>> (this_seg, (mm_ptr + iter));
         // Communicate the data
-        NCCL_CHECK(ncclReduceScatter((void *)(c_ptr + acc_addr), (void *)(d_ptr + acc_addr / this->my_size), 
-            (commSize / this->my_size), ncclFloat16, ncclSum, this->comm, this->comm_stream));
+        MCCL_CHECK(mcclReduceScatter((void *)(c_ptr + acc_addr), (void *)(d_ptr + acc_addr / this->my_size), 
+            (commSize / this->my_size), mcclFloat16, mcclSum, this->comm, this->comm_stream));
         acc_addr += commSize;
     }
 
