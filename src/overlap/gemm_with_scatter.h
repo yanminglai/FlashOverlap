@@ -597,9 +597,9 @@ public:
 
     params_ = Params(args);
 
-    cudaError_t result = cudaGetLastError();
+    musaError_t result = musaGetLastError();
 
-    if (result != cudaSuccess) {
+    if (result != musaSuccess) {
       return cutlass::Status::kErrorInternal;
     }
 
@@ -607,7 +607,7 @@ public:
   }
 
   /// Run
-  Status run(cudaStream_t stream) {
+  Status run(musaStream_t stream) {
 
     //
     // Launch the fused kernel
@@ -618,23 +618,23 @@ public:
 
     int gemm_smem_size = int(sizeof(typename GemmEpilogueFusion::SharedStorage));
 
-    cudaError_t result;
+    musaError_t result;
 
     if (gemm_smem_size >= (48 << 10)) {
-      result = cudaFuncSetAttribute(cutlass::Kernel<GemmEpilogueFusion>,
-                                    cudaFuncAttributeMaxDynamicSharedMemorySize,
+      result = musaFuncSetAttribute(cutlass::Kernel<GemmEpilogueFusion>,
+                                    musaFuncAttributeMaxDynamicSharedMemorySize,
                                     gemm_smem_size);
 
-      if (result != cudaSuccess) {
+      if (result != musaSuccess) {
         return Status::kErrorInternal;
       }
     }
 
     cutlass::Kernel<GemmEpilogueFusion><<<gemm_grid, gemm_block, gemm_smem_size, stream>>>(params_.gemm);
 
-    result = cudaGetLastError();
+    result = musaGetLastError();
 
-    if (result != cudaSuccess) {
+    if (result != musaSuccess) {
       return cutlass::Status::kErrorInternal;
     }
 
@@ -642,7 +642,7 @@ public:
   }
 
   /// Function call operator
-  Status operator()(cudaStream_t stream = nullptr) {
+  Status operator()(musaStream_t stream = nullptr) {
     return run(stream);
   }
 };

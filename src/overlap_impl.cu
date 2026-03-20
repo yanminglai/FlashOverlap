@@ -5,9 +5,9 @@
 #include "tiling/signal_tiling.cuh"
 #include "tiling/scatter_tiling.cuh"
 
-#include <cuda.h>
-#include <cuda_runtime.h>
-#include <cuda_fp16.h>
+#include <musa.h>
+#include <musa_runtime.h>
+#include <musa_fp16.h>
 #include <math.h>
 #include <string>
 #include <stdio.h>
@@ -29,7 +29,7 @@ OverlapImpl::~OverlapImpl(){
 }
 
 void OverlapImpl::CutlassInit(){
-    this->gemm_stream = at::cuda::getCurrentCUDAStream().stream();
+    this->gemm_stream = at::musa::getCurrentMUSAStream().stream();
 }
 
 void OverlapImpl::Gemm(at::Tensor A, at::Tensor B, at::Tensor C, int64_t Algo){
@@ -137,7 +137,7 @@ void OverlapImpl::GemmAll2All(at::Tensor A, at::Tensor B, at::Tensor C, at::Tens
 }
 
 void OverlapImpl::OverlapInit(){
-    cudaStreamCreateWithPriority(&this->comm_stream, cudaStreamNonBlocking, -5);
+    musaStreamCreateWithPriority(&this->comm_stream, musaStreamNonBlocking, -5);
 }
 
 void OverlapImpl::McclAllReduce(at::Tensor C){
@@ -257,10 +257,10 @@ void OverlapImpl::GemmAllReduceOverlap(
         acc_addr += commSize;
     }
 
-    cudaEventCreateWithFlags(&this->gemm_finished, cudaEventDisableTiming);
-    cudaEventRecord(this->gemm_finished, this->comm_stream);
-    cudaStreamWaitEvent(this->gemm_stream, this->gemm_finished, 0);
-    cudaEventDestroy(this->gemm_finished);
+    musaEventCreateWithFlags(&this->gemm_finished, musaEventDisableTiming);
+    musaEventRecord(this->gemm_finished, this->comm_stream);
+    musaStreamWaitEvent(this->gemm_stream, this->gemm_finished, 0);
+    musaEventDestroy(this->gemm_finished);
 }
 
 void OverlapImpl::GemmReduceScatterOverlap(
@@ -314,8 +314,8 @@ void OverlapImpl::GemmReduceScatterOverlap(
         acc_addr += commSize;
     }
 
-    cudaEventCreateWithFlags(&this->gemm_finished, cudaEventDisableTiming);
-    cudaEventRecord(this->gemm_finished, this->comm_stream);
-    cudaStreamWaitEvent(this->gemm_stream, this->gemm_finished, 0);
-    cudaEventDestroy(this->gemm_finished);
+    musaEventCreateWithFlags(&this->gemm_finished, musaEventDisableTiming);
+    musaEventRecord(this->gemm_finished, this->comm_stream);
+    musaStreamWaitEvent(this->gemm_stream, this->gemm_finished, 0);
+    musaEventDestroy(this->gemm_finished);
 }

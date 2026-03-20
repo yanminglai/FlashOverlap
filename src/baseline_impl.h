@@ -5,7 +5,7 @@
 #include <cublas_v2.h>
 
 #include <ATen/ATen.h>
-#include <ATen/cuda/CUDAContext.h>
+#include "torch_musa/csrc/aten/musa/MUSAContext.h"
 
 class BaselineImpl : public torch::CustomClassHolder {
     public:
@@ -30,5 +30,5 @@ class BaselineImpl : public torch::CustomClassHolder {
         int64_t my_size;
 
         cublasHandle_t my_handle;
-        cudaStream_t my_stream;
+        musaStream_t my_stream;
 };

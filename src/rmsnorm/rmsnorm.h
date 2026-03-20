@@ -1,7 +1,7 @@
 #pragma once
 
 #include <ATen/ATen.h>
-#include <ATen/cuda/CUDAContext.h>
+#include "torch_musa/csrc/aten/musa/MUSAContext.h"
 
 void rmsnorm(at::Tensor X, at::Tensor RX, at::Tensor RW);
 void reorder_rmsnorm(at::Tensor X, at::Tensor RX, at::Tensor RW, 

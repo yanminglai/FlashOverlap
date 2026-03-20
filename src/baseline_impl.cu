@@ -1,7 +1,7 @@
 #include "mccl_utils.h"
-#include <cuda.h>
-#include <cuda_runtime.h>
-#include <cuda_fp16.h>
+#include <musa.h>
+#include <musa_runtime.h>
+#include <musa_fp16.h>
 #include <math.h>
 #include <string>
 #include <stdio.h>
@@ -184,7 +184,7 @@ void BaselineImpl::McclInit(const int64_t tp_rank, const int64_t tp_size, const 
 void BaselineImpl::CublasInit(){
 
     // prepare for GEMM
-    this->my_stream = at::cuda::getCurrentCUDAStream().stream();
+    this->my_stream = at::musa::getCurrentMUSAStream().stream();
     cublasSetStream(this->my_handle, this->my_stream);
     cublasSetMathMode(this->my_handle, CUBLAS_TENSOR_OP_MATH);
 }

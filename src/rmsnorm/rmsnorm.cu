@@ -1,9 +1,9 @@
 #pragma once
 
 #include <ATen/ATen.h>
-#include <ATen/cuda/CUDAContext.h>
-#include <cuda.h>
-#include <cuda_runtime.h>
+#include "torch_musa/csrc/aten/musa/MUSAContext.h"
+#include <musa.h>
+#include <musa_runtime.h>
 #include <math.h>
 #include <stdio.h>
 #include <stdlib.h>

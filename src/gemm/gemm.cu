@@ -1,4 +1,4 @@
-#include <cuda_fp16.h>
+#include <musa_fp16.h>
 
 #include "gemm.h"
 
@@ -22,7 +22,7 @@
 
 template <int ThreadblockM, int ThreadblockN, int ThreadblockK, int WarpM, int WarpN, int WarpK, 
 int InstructionM, int InstructionN, int InstructionK, int NumStages, int SwizzleSize, int SplitK>
-void cutlass_gemm_splitk(int M, int N, int K, const half* A, const half* B, half* D, cudaStream_t stream = nullptr){
+void cutlass_gemm_splitk(int M, int N, int K, const half* A, const half* B, half* D, musaStream_t stream = nullptr){
 
     using ThreadblockShape = cutlass::gemm::GemmShape<ThreadblockM, ThreadblockN, ThreadblockK>;
     using WarpShape = cutlass::gemm::GemmShape<WarpM, WarpN, WarpK>;
@@ -115,7 +115,7 @@ void cutlass_gemm_splitk(int M, int N, int K, const half* A, const half* B, half
     template void                                                                                                    \
     cutlass_gemm_splitk<ThreadblockM, ThreadblockN, ThreadblockK, WarpM, WarpN, \
                                     WarpK, InstructionM, InstructionN, InstructionK, NumStages, SwizzleSize, SplitK>(            \
-        int M, int N, int K, const half* A, const half* B, half* D, cudaStream_t stream = nullptr)
+        int M, int N, int K, const half* A, const half* B, half* D, musaStream_t stream = nullptr)
 
 #include "../inc/gemm_instances.inc"
 

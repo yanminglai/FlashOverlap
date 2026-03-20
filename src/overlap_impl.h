@@ -5,7 +5,7 @@
 #include <cublas_v2.h>
 
 #include <ATen/ATen.h>
-#include <ATen/cuda/CUDAContext.h>
+#include "torch_musa/csrc/aten/musa/MUSAContext.h"
 
 #include "cutlass/util/device_memory.h"
 
@@ -33,9 +33,9 @@ class OverlapImpl : public torch::CustomClassHolder {
         void McclAll2All(at::Tensor C, at::Tensor D, at::Tensor mLen_CPU);
 
     private:
-        cudaStream_t gemm_stream;
-        cudaStream_t comm_stream;
-        cudaEvent_t gemm_finished;
+        musaStream_t gemm_stream;
+        musaStream_t comm_stream;
+        musaEvent_t gemm_finished;
 
         mcclComm_t comm;
         int64_t my_rank;
