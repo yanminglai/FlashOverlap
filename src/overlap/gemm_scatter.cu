@@ -1,110 +1,119 @@
 #include <musa_fp16.h>
-
-#include "cutlass/cutlass.h"
-#include "cutlass/arch/memory.h"
-#include "cutlass/gemm/device/gemm_complex.h"
-#include "cutlass/epilogue/thread/scale_type.h"
-
-#include "cutlass/util/command_line.h"
-#include "cutlass/util/tensor_view_io.h"
-#include "cutlass/fast_math.h"
+#include <iostream>
 
 #include "gemm_scatter.h"
 #include "gemm_with_scatter.h"
 
-template <int ThreadblockM, int ThreadblockN, int ThreadblockK, int WarpM, int WarpN, int WarpK, 
-int InstructionM, int InstructionN, int InstructionK, int NumStages, int SwizzleSize, int SplitK>
-void cutlass_gemm_scatter(int M, int N, int K, int ReLDN, int* CommThr, half* A, half* B, half* D, int* MM, int* RA, int* RE, bool Monitor, musaStream_t stream = nullptr){
+#include "mutlass/mutlass.h"
+#include "mutlass/gemm/device/gemm_universal_adapter.h"
+#include "mutlass/gemm/kernel/gemm_universal.hpp"
+#include "mutlass/gemm/collective/collective_builder.hpp"
+#include "mutlass/util/packed_stride.hpp"
+#include "mutlass/util/device_memory.h"
 
-    using ThreadblockShape = cutlass::gemm::GemmShape<ThreadblockM, ThreadblockN, ThreadblockK>;
-    using WarpShape = cutlass::gemm::GemmShape<WarpM, WarpN, WarpK>;
-    using InstructionShape = cutlass::gemm::GemmShape<InstructionM, InstructionN, InstructionK>;
-    cutlass::gemm::GemmCoord problem_size(M, N, K);
+using namespace mute;
 
-    // A matrix configuration
-    using ElementA = cutlass::half_t;                                // Element type for A matrix operand
-    using LayoutA = cutlass::layout::RowMajor;                      // Layout type for A matrix operand
-    constexpr int AlignmentA  = 128 / cutlass::sizeof_bits<ElementA>::value;    // Memory access granularity/alignment of A matrix in units of elements (up to 16 bytes)
+#define MUTLASS_CHECK(status)                                                                    \
+  {                                                                                              \
+    mutlass::Status error = status;                                                              \
+    if (error != mutlass::Status::kSuccess) {                                                    \
+      std::cerr << "Got mutlass error: " << mutlassGetStatusString(error) << " at: " << __LINE__ \
+                << std::endl;                                                                    \
+      exit(EXIT_FAILURE);                                                                        \
+    }                                                                                            \
+  }
 
-    // B matrix configuration
-    using ElementB = cutlass::half_t;                                // Element type for B matrix operand
-    using LayoutB = cutlass::layout::ColumnMajor;                      // Layout type for B matrix operand
-    constexpr int AlignmentB  = 128 / cutlass::sizeof_bits<ElementB>::value;    // Memory access granularity/alignment of B matrix in units of elements (up to 16 bytes)
+template <int TileM, int TileN, int TileK>
+void mutlass_gemm_scatter(int M, int N, int K, int ReLDN, int* CommThr,
+                          half* A, half* B, half* D, int* MM, int* RA,
+                          int* RE, bool Monitor, musaStream_t stream) {
+    using namespace mutlass;
 
-    // C/D matrix configuration
-    using ElementC = cutlass::half_t;                                // Element type for C and D matrix operands
-    using LayoutC = cutlass::layout::RowMajor;                      // Layout type for C and D matrix operands
-    constexpr int AlignmentC  = 128 / cutlass::sizeof_bits<ElementC>::value;    // Memory access granularity/alignment of C/D matrices in units of elements (up to 16 bytes)
+    using ElementA           = half_t;
+    using LayoutA            = layout::RowMajor;
+    using ElementB           = half_t;
+    using LayoutB            = layout::ColumnMajor;
+    using ElementD           = half_t;
+    using ElementAccumulator = float;
 
-    // Multiply-accumulate blocking/pipelining details
-    using ElementAccumulator  = cutlass::half_t;                          // Element type for internal accumulation
-    using ArchTag             = cutlass::arch::Sm80;                      // Tag indicating the minimum SM that supports the intended feature
-    using OperatorClass       = cutlass::arch::OpClassTensorOp;           // Operator class tag
+    static constexpr int AlignmentA = 16 / sizeof(ElementA);  // 8
+    static constexpr int AlignmentB = 16 / sizeof(ElementB);  // 8
 
-    // Epilogue output operator
-    using EpilogueOp = cutlass::epilogue::thread::LinearCombination<
-        ElementC,               // Element type for C and D matrix operands
-        AlignmentC,             // Memory access granularity of C and D matrix in units of elements
-        ElementAccumulator,     // Element type from internal accumaccumulation
-        ElementAccumulator>;    // Data type used to compute linear combination
+    using ArchTag   = arch::Mp22;
+    using OpClass   = arch::OpClassTensorOp;
+    using TileShape = Shape<Int<TileM>, Int<TileN>, Int<TileK>>;
 
-    using SwizzleThreadBlock = cutlass::gemm::threadblock::GemmIdentityThreadblockSwizzle<SwizzleSize>;
+    // Build mainloop collective (same as standard GEMM)
+    using CollectiveMainloop = typename gemm::collective::CollectiveBuilder<
+        ArchTag, OpClass,
+        ElementA, LayoutA, AlignmentA,
+        ElementB, LayoutB, AlignmentB,
+        ElementAccumulator,
+        TileShape,
+        Shape<_1, _1, _1>,
+        gemm::collective::StageCountAuto,
+        gemm::collective::KernelScheduleAuto
+    >::CollectiveOp;
 
-    static bool const kInternalTranspose = cutlass::platform::is_same<LayoutC, cutlass::layout::ColumnMajor>::value;
+    // Custom scatter epilogue
+    using StrideC = Stride<int, _1, int>;
+    using StrideD = Stride<int, _1, int>;
+    using EpiSchedule = epilogue::collective::EpilogueScheduleAuto;
 
-    using GemmScatter = cutlass::GemmScatter<
-      ElementA,
-      LayoutA, 
-      ElementB,
-      LayoutB, 
-      ElementC,
-      LayoutC,
-      ElementAccumulator,
-      EpilogueOp,
-      ThreadblockShape,
-      WarpShape,
-      InstructionShape,
-      NumStages,
-      SwizzleSize
+    using CollectiveEpilogue = epilogue::collective::ScatterEpilogue<
+        StrideC, StrideD, EpiSchedule, TileM, TileN
     >;
 
-    typename GemmScatter::Arguments arguments(
-      problem_size,
-      reinterpret_cast<cutlass::half_t*>(A),
-      reinterpret_cast<cutlass::half_t*>(B), 
-      reinterpret_cast<cutlass::half_t*>(D), 
-      reinterpret_cast<cutlass::half_t*>(D), 
-      (int64_t)K, 
-      (int64_t)K, 
-      (int64_t)N, 
-      (int64_t)N, 
-      {
-        ElementAccumulator(1.0f),
-        ElementAccumulator(0.0f)
-      },
-      MM, 
-      RA, 
-      (N / ThreadblockN),
-      ReLDN,
-      CommThr, 
-      RE, 
-      Monitor
-    );
+    // Assemble kernel
+    using GemmKernel = gemm::kernel::GemmUniversal<
+        Shape<int, int, int, int>,
+        CollectiveMainloop,
+        CollectiveEpilogue
+    >;
+    using Gemm = gemm::device::GemmUniversalAdapter<GemmKernel>;
 
-    GemmScatter gemm_op;
+    // Compute strides
+    using MainloopStrideA = typename Gemm::GemmKernel::StrideA;
+    using MainloopStrideB = typename Gemm::GemmKernel::StrideB;
 
-    CUTLASS_CHECK(gemm_op.initialize(arguments));
-    CUTLASS_CHECK(gemm_op(stream));
+    auto stride_A = make_mute_packed_stride(MainloopStrideA{}, make_shape(M, K, 1));
+    auto stride_B = make_mute_packed_stride(MainloopStrideB{}, make_shape(N, K, 1));
+
+    int monitor_columns = N / TileN;
+
+    // Build arguments
+    typename Gemm::Arguments arguments{
+        gemm::GemmUniversalMode::kGemm,
+        {M, N, K, 1},
+        {reinterpret_cast<const ElementA*>(A), stride_A,
+         reinterpret_cast<const ElementB*>(B), stride_B},
+        {1.0f, 0.0f,
+         nullptr, StrideC{},                              // No source C
+         reinterpret_cast<ElementD*>(D), StrideD{},
+         MM,                                              // ptr_monitor_matrix
+         RA,                                              // ptr_reorder_array
+         monitor_columns,                                 // monitor_columns
+         ReLDN,                                           // reorder_columns
+         CommThr,                                         // ptr_comm_seg_array
+         RE,                                              // ptr_row_array
+         Monitor},                                        // if_monitor
+        KernelHardwareInfo{}
+    };
+
+    Gemm gemm_op;
+    size_t workspace_size = Gemm::get_workspace_size(arguments);
+    mutlass::device_memory::allocation<uint8_t> workspace(workspace_size);
+    MUTLASS_CHECK(gemm_op.can_implement(arguments));
+    MUTLASS_CHECK(gemm_op.initialize(arguments, workspace.get()));
+    MUTLASS_CHECK(gemm_op.run(stream));
 }
 
-#define CUTLASS_GEMM_SCATTER_INIT(ThreadblockM, ThreadblockN, ThreadblockK, WarpM,         \
-                                        WarpN, WarpK, InstructionM, InstructionN,                \
-                                        InstructionK, NumStages, SwizzleSize, SplitK)                                                           \
-    template void                                                                                                    \
-    cutlass_gemm_scatter<ThreadblockM, ThreadblockN, ThreadblockK, WarpM, WarpN, \
-                                    WarpK, InstructionM, InstructionN, InstructionK, NumStages, SwizzleSize, SplitK>(            \
-        int M, int N, int K, int ReLDN, int* CommThr, half* A, half* B, half* D, int* MM, int* RA, int* RE, bool Monitor, musaStream_t stream = nullptr)
+#define MUTLASS_SCATTER_INIT(TileM, TileN, TileK)                           \
+    template void mutlass_gemm_scatter<TileM, TileN, TileK>(                \
+        int M, int N, int K, int ReLDN, int* CommThr,                       \
+        half* A, half* B, half* D, int* MM, int* RA,                        \
+        int* RE, bool Monitor, musaStream_t stream)
 
 #include "../inc/scatter_instances.inc"
 
-#undef CUTLASS_GEMM_SCATTER_INIT
+#undef MUTLASS_SCATTER_INIT

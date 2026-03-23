@@ -1,5 +1,7 @@
-#include <musa_fp16.h>
+#pragma once
 
-template <int ThreadblockM, int ThreadblockN, int ThreadblockK, int WarpM, int WarpN, int WarpK, 
-int InstructionM, int InstructionN, int InstructionK, int NumStages, int SwizzleSize, int SplitK>
-void cutlass_gemm_splitk(int M, int N, int K, const half* A, const half* B, half* D, musaStream_t stream);
+#include <musa_fp16.h>
+#include <musa_runtime.h>
+
+template <int TileM, int TileN, int TileK>
+void mutlass_gemm(int M, int N, int K, const half* A, const half* B, half* D, musaStream_t stream);

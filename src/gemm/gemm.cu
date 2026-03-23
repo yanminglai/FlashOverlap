@@ -1,122 +1,117 @@
 #include <musa_fp16.h>
+#include <iostream>
 
 #include "gemm.h"
 
-#include "cutlass/cutlass.h"
-#include "cutlass/gemm/device/gemm_universal.h"
+#include "mutlass/mutlass.h"
+#include "mutlass/gemm/device/gemm_universal_adapter.h"
+#include "mutlass/gemm/kernel/gemm_universal.hpp"
+#include "mutlass/gemm/collective/collective_builder.hpp"
+#include "mutlass/epilogue/collective/collective_builder.hpp"
+#include "mutlass/util/packed_stride.hpp"
+#include "mutlass/util/device_memory.h"
 
-#include "cutlass/util/command_line.h"
-#include "cutlass/util/host_tensor.h"
-#include "cutlass/util/reference/device/gemm.h"
-#include "cutlass/util/tensor_view_io.h"
+using namespace mute;
 
-#define CUTLASS_CHECK(status)                                                                    \
+#define MUTLASS_CHECK(status)                                                                    \
   {                                                                                              \
-    cutlass::Status error = status;                                                              \
-    if (error != cutlass::Status::kSuccess) {                                                    \
-      std::cerr << "Got cutlass error: " << cutlassGetStatusString(error) << " at: " << __LINE__ \
+    mutlass::Status error = status;                                                              \
+    if (error != mutlass::Status::kSuccess) {                                                    \
+      std::cerr << "Got mutlass error: " << mutlassGetStatusString(error) << " at: " << __LINE__ \
                 << std::endl;                                                                    \
       exit(EXIT_FAILURE);                                                                        \
     }                                                                                            \
   }
 
-template <int ThreadblockM, int ThreadblockN, int ThreadblockK, int WarpM, int WarpN, int WarpK, 
-int InstructionM, int InstructionN, int InstructionK, int NumStages, int SwizzleSize, int SplitK>
-void cutlass_gemm_splitk(int M, int N, int K, const half* A, const half* B, half* D, musaStream_t stream = nullptr){
+template <int TileM, int TileN, int TileK>
+void mutlass_gemm(int M, int N, int K, const half* A, const half* B, half* D, musaStream_t stream) {
 
-    using ThreadblockShape = cutlass::gemm::GemmShape<ThreadblockM, ThreadblockN, ThreadblockK>;
-    using WarpShape = cutlass::gemm::GemmShape<WarpM, WarpN, WarpK>;
-    using InstructionShape = cutlass::gemm::GemmShape<InstructionM, InstructionN, InstructionK>;
-    cutlass::gemm::GemmCoord problem_size(M, N, K);
+    using namespace mutlass;
 
-    // A matrix configuration
-    using ElementA = cutlass::half_t;                                // Element type for A matrix operand
-    using LayoutA = cutlass::layout::RowMajor;                      // Layout type for A matrix operand
-    constexpr int AlignmentA  = 128 / cutlass::sizeof_bits<ElementA>::value;    // Memory access granularity/alignment of A matrix in units of elements (up to 16 bytes)
+    // Element types
+    using ElementA           = half_t;
+    using LayoutA            = layout::RowMajor;
+    using ElementB           = half_t;
+    using LayoutB            = layout::ColumnMajor;
+    using ElementD           = half_t;
+    using LayoutD            = layout::RowMajor;
+    using ElementAccumulator = float;
+    using ElementCompute     = float;
 
-    // B matrix configuration
-    using ElementB = cutlass::half_t;                                // Element type for B matrix operand
-    using LayoutB = cutlass::layout::ColumnMajor;                      // Layout type for B matrix operand
-    constexpr int AlignmentB  = 128 / cutlass::sizeof_bits<ElementB>::value;    // Memory access granularity/alignment of B matrix in units of elements (up to 16 bytes)
+    static constexpr int AlignmentA = 16 / sizeof(ElementA);  // 8
+    static constexpr int AlignmentB = 16 / sizeof(ElementB);  // 8
+    static constexpr int AlignmentD = 16 / sizeof(ElementD);  // 8
 
-    // C/D matrix configuration
-    using ElementC = cutlass::half_t;                                // Element type for C and D matrix operands
-    using LayoutC = cutlass::layout::RowMajor;                      // Layout type for C and D matrix operands
-    constexpr int AlignmentC  = 128 / cutlass::sizeof_bits<ElementC>::value;    // Memory access granularity/alignment of C/D matrices in units of elements (up to 16 bytes)
+    using ArchTag   = arch::Mp22;
+    using OpClass   = arch::OpClassTensorOp;
+    using TileShape = Shape<Int<TileM>, Int<TileN>, Int<TileK>>;
 
-    // Multiply-accumulate blocking/pipelining details
-    using ElementAccumulator  = cutlass::half_t;                          // Element type for internal accumulation
-    using ArchTag             = cutlass::arch::Sm80;                      // Tag indicating the minimum SM that supports the intended feature
-    using OperatorClass       = cutlass::arch::OpClassTensorOp;           // Operator class tag
-
-    // Epilogue output operator
-    using EpilogueOp = cutlass::epilogue::thread::LinearCombination<
-        ElementC,               // Element type for C and D matrix operands
-        AlignmentC,             // Memory access granularity of C and D matrix in units of elements
-        ElementAccumulator,     // Element type from internal accumaccumulation
-        ElementAccumulator>;    // Data type used to compute linear combination
-
-    // Classic data-parallel device GEMM implementation type
-    using DeviceGemmBasic = cutlass::gemm::device::GemmUniversal<
-        ElementA, LayoutA,
-        ElementB, LayoutB,
-        ElementC, LayoutC,
+    // Build mainloop collective
+    using CollectiveMainloop = typename gemm::collective::CollectiveBuilder<
+        ArchTag, OpClass,
+        ElementA, LayoutA, AlignmentA,
+        ElementB, LayoutB, AlignmentB,
         ElementAccumulator,
-        OperatorClass,
-        ArchTag,
-        ThreadblockShape,
-        WarpShape,
-        InstructionShape,
-        EpilogueOp,
-        cutlass::gemm::threadblock::GemmIdentityThreadblockSwizzle<SwizzleSize>,
-        NumStages,
-        AlignmentA,
-        AlignmentB>;
+        TileShape,
+        Shape<_1, _1, _1>,                              // ClusterShape
+        gemm::collective::StageCountAuto,
+        gemm::collective::KernelScheduleAuto
+    >::CollectiveOp;
 
-    int64_t batch_stride_A = problem_size.m() * problem_size.k();
-    int64_t batch_stride_B = problem_size.k() * problem_size.n();
-    int64_t batch_stride_C = problem_size.m() * problem_size.n();
-    int64_t batch_stride_D = problem_size.m() * problem_size.n();
+    // Build epilogue collective (standard linear combination, no source C)
+    using CollectiveEpilogue = typename epilogue::collective::CollectiveBuilder<
+        ArchTag, OpClass,
+        TileShape,
+        Shape<_1, _1, _1>,
+        epilogue::collective::EpilogueTileAuto,
+        ElementAccumulator, ElementCompute,
+        void, LayoutD, AlignmentD,                       // C = void (beta = 0, skip source load)
+        ElementD, LayoutD, AlignmentD,
+        epilogue::collective::EpilogueScheduleAuto
+    >::CollectiveOp;
 
-    auto arguments = typename DeviceGemmBasic::Arguments(
-        cutlass::gemm::GemmUniversalMode::kGemm,  // universal mode
-        problem_size,                             // problem_size
-        SplitK,                                        // batch count / splitk slices
-        {                                         // epilogue parameters
-        ElementAccumulator(1.0f),
-        ElementAccumulator(0.0f)
-        },
-        A,                   // ptr_A
-        B,                   // ptr_B
-        D,                   // ptr_C
-        D,                   // ptr_D
-        batch_stride_A,      // batch_stride_A
-        batch_stride_B,      // batch_stride_B
-        batch_stride_C,      // batch_stride_C
-        batch_stride_D,      // batch_stride_D
-        K,              // stride_a
-        K,              // stride_b
-        N,              // stride_c
-        N);                 // stride_d                                  
+    // Assemble kernel
+    using GemmKernel = gemm::kernel::GemmUniversal<
+        Shape<int, int, int, int>,
+        CollectiveMainloop,
+        CollectiveEpilogue
+    >;
+    using Gemm = gemm::device::GemmUniversalAdapter<GemmKernel>;
 
-    DeviceGemmBasic gemm_op;
-    // workspace_size = 0
-    size_t workspace_size = DeviceGemmBasic::get_workspace_size(arguments);
-    cutlass::device_memory::allocation<uint8_t> workspace(workspace_size);
-    CUTLASS_CHECK(gemm_op.can_implement(arguments));
-    CUTLASS_CHECK(gemm_op.initialize(arguments, workspace.get()));
+    // Compute strides
+    using StrideA = typename Gemm::GemmKernel::StrideA;
+    using StrideB = typename Gemm::GemmKernel::StrideB;
+    using StrideD = typename Gemm::GemmKernel::StrideD;
 
-    CUTLASS_CHECK(gemm_op(stream));
+    auto stride_A = make_mute_packed_stride(StrideA{}, make_shape(M, K, 1));
+    auto stride_B = make_mute_packed_stride(StrideB{}, make_shape(N, K, 1));
+    auto stride_D = make_mute_packed_stride(StrideD{}, make_shape(M, N, 1));
+
+    // Build arguments
+    typename Gemm::Arguments arguments{
+        gemm::GemmUniversalMode::kGemm,
+        {M, N, K, 1},
+        {reinterpret_cast<const ElementA*>(A), stride_A,
+         reinterpret_cast<const ElementB*>(B), stride_B},
+        {{1.0f, 0.0f},
+         nullptr, {},                                    // No source C
+         reinterpret_cast<ElementD*>(D), stride_D},
+        KernelHardwareInfo{}
+    };
+
+    Gemm gemm_op;
+    size_t workspace_size = Gemm::get_workspace_size(arguments);
+    mutlass::device_memory::allocation<uint8_t> workspace(workspace_size);
+    MUTLASS_CHECK(gemm_op.can_implement(arguments));
+    MUTLASS_CHECK(gemm_op.initialize(arguments, workspace.get()));
+    MUTLASS_CHECK(gemm_op.run(stream));
 }
 
-#define CUTLASS_GEMM_SPLITK_INIT(ThreadblockM, ThreadblockN, ThreadblockK, WarpM,         \
-                                        WarpN, WarpK, InstructionM, InstructionN,                \
-                                        InstructionK, NumStages, SwizzleSize, SplitK)                                                           \
-    template void                                                                                                    \
-    cutlass_gemm_splitk<ThreadblockM, ThreadblockN, ThreadblockK, WarpM, WarpN, \
-                                    WarpK, InstructionM, InstructionN, InstructionK, NumStages, SwizzleSize, SplitK>(            \
-        int M, int N, int K, const half* A, const half* B, half* D, musaStream_t stream = nullptr)
+#define MUTLASS_GEMM_INIT(TileM, TileN, TileK)                  \
+    template void mutlass_gemm<TileM, TileN, TileK>(            \
+        int M, int N, int K, const half* A, const half* B,      \
+        half* D, musaStream_t stream)
 
 #include "../inc/gemm_instances.inc"
 
-#undef CUTLASS_GEMM_SPLITK_INIT
+#undef MUTLASS_GEMM_INIT

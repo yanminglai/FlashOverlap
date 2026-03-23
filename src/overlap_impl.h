@@ -6,7 +6,7 @@
 #include <ATen/ATen.h>
 #include "torch_musa/csrc/aten/musa/MUSAContext.h"
 
-#include "cutlass/util/device_memory.h"
+#include "mutlass/util/device_memory.h"
 
 class OverlapImpl : public torch::CustomClassHolder {
     public:
