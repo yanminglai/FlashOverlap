@@ -7,7 +7,10 @@
 #include "mutlass/gemm/device/gemm_universal_adapter.h"
 #include "mutlass/gemm/kernel/gemm_universal.hpp"
 #include "mutlass/gemm/collective/collective_builder.hpp"
+#include "mutlass/gemm/dispatch_policy.hpp"
 #include "mutlass/epilogue/collective/collective_builder.hpp"
+#include "mutlass/epilogue/dispatch_policy.hpp"
+#include "mutlass/epilogue/fusion/operations.hpp"
 #include "mutlass/util/packed_stride.hpp"
 #include "mutlass/util/device_memory.h"
 
@@ -42,7 +45,7 @@ void mutlass_gemm(int M, int N, int K, const half* A, const half* B, half* D, mu
     static constexpr int AlignmentB = 16 / sizeof(ElementB);  // 8
     static constexpr int AlignmentD = 16 / sizeof(ElementD);  // 8
 
-    using ArchTag   = arch::Mp22;
+    using ArchTag   = arch::Mp31;
     using OpClass   = arch::OpClassTensorOp;
     using TileShape = Shape<Int<TileM>, Int<TileN>, Int<TileK>>;
 
@@ -55,10 +58,11 @@ void mutlass_gemm(int M, int N, int K, const half* A, const half* B, half* D, mu
         TileShape,
         Shape<_1, _1, _1>,                              // ClusterShape
         gemm::collective::StageCountAuto,
-        gemm::collective::KernelScheduleAuto
+        gemm::KernelTme
     >::CollectiveOp;
 
     // Build epilogue collective (standard linear combination, no source C)
+    using FusionOp = epilogue::fusion::LinearCombination<ElementD, ElementCompute, void, ElementCompute>;
     using CollectiveEpilogue = typename epilogue::collective::CollectiveBuilder<
         ArchTag, OpClass,
         TileShape,
@@ -67,7 +71,8 @@ void mutlass_gemm(int M, int N, int K, const half* A, const half* B, half* D, mu
         ElementAccumulator, ElementCompute,
         void, LayoutD, AlignmentD,                       // C = void (beta = 0, skip source load)
         ElementD, LayoutD, AlignmentD,
-        epilogue::collective::EpilogueScheduleAuto
+        epilogue::NoSmem,
+        FusionOp
     >::CollectiveOp;
 
     // Assemble kernel

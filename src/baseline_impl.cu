@@ -1,3 +1,8 @@
+// Suppress __CUDA__ to avoid c10::Half / MUSA __half conversion error
+// in PyTorch's Half-inl.h when compiled with mcc -x musa.
+#pragma push_macro("__CUDA__")
+#undef __CUDA__
+
 #include "mccl_utils.h"
 #include <musa.h>
 #include <musa_runtime.h>
@@ -9,6 +14,8 @@
 #include <cstdio>
 
 #include "baseline_impl.h"
+
+#pragma pop_macro("__CUDA__")
 
 #define DIV_UP(x, y) (((x) + (y) - 1) / (y))
 #define MAX_GROUP_SIZE 16
@@ -184,7 +191,7 @@ void BaselineImpl::McclInit(const int64_t tp_rank, const int64_t tp_size, const 
 void BaselineImpl::MublasInit(){
 
     // prepare for GEMM
-    this->my_stream = at::musa::getCurrentMUSAStream().stream();
+    this->my_stream = c10::musa::getCurrentMUSAStream().stream();
     mublasSetStream(this->my_handle, this->my_stream);
 }
 

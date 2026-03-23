@@ -43,7 +43,7 @@ else()
   message(WARNING "mublas library not found, will rely on torch_musa to provide it")
 endif()
 
-# MUSA target architecture (mp_22 for Quyuan, mp_31 for newer)
+# MUSA target architecture (mp_22 for Quyuan 1, mp_31 for Quyuan 2)
 set(MUSA_ARCH "mp_31" CACHE STRING "MUSA target architecture")
 message(STATUS "MUSA_ARCH: ${MUSA_ARCH}")
 

@@ -14,6 +14,7 @@
 #include "mutlass/mutlass.h"
 #include "mutlass/gemm/gemm.h"
 #include "mutlass/epilogue/collective/detail.hpp"
+#include "mutlass/epilogue/thread/linear_combination.h"
 
 #include "mute/tensor.hpp"
 #include "mute/numeric/numeric_types.hpp"
@@ -54,6 +55,9 @@ public:
 
   using GmemTiledCopyC = void;
   using GmemTiledCopyD = void;
+
+  using ThreadEpilogueOp = epilogue::thread::LinearCombination<
+      ElementD, 1, ElementAccumulator, ElementCompute>;
 
   static constexpr int NumBarriers = 0;
 

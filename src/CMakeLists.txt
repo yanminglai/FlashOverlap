@@ -26,10 +26,19 @@ target_include_directories(overlap PUBLIC ${PROJECT_SOURCE_DIR}/src/3rdparty/mut
 set_property(TARGET overlap PROPERTY POSITION_INDEPENDENT_CODE ON)
 
 # ====== RMSNorm library ======
-file(GLOB norm_files ${PROJECT_SOURCE_DIR}/src/rmsnorm/*.cu)
-set_musa_source_properties(${norm_files})
-add_library(norm STATIC ${norm_files})
+# rmsnorm_launch.cu contains kernel launches — needs -x musa.
+# rmsnorm.cpp is the PyTorch wrapper — compiled as plain CXX.
+set_musa_source_properties(${PROJECT_SOURCE_DIR}/src/rmsnorm/rmsnorm_launch.cu)
+add_library(norm STATIC
+    ${PROJECT_SOURCE_DIR}/src/rmsnorm/rmsnorm_launch.cu
+    ${PROJECT_SOURCE_DIR}/src/rmsnorm/rmsnorm.cpp
+)
 set_property(TARGET norm PROPERTY POSITION_INDEPENDENT_CODE ON)
+
+# ====== Wait-flag kernel launch (needs -x musa for <<<>>>) ======
+set_musa_source_properties(wait_launch.cu)
+add_library(wait_launch STATIC wait_launch.cu)
+set_property(TARGET wait_launch PROPERTY POSITION_INDEPENDENT_CODE ON)
 
 # ====== BaselineImpl (muBLAS + MCCL path) ======
 set_musa_source_properties(baseline_impl.cu)
@@ -41,11 +50,10 @@ target_link_libraries (baseline_impl PUBLIC gemm overlap norm)
 set_musa_source_properties(overlap_impl.cu)
 add_library(overlap_impl overlap_impl.cu)
 set_property(TARGET overlap_impl PROPERTY POSITION_INDEPENDENT_CODE ON)
-target_link_libraries (overlap_impl PUBLIC gemm overlap norm)
+target_link_libraries (overlap_impl PUBLIC gemm overlap norm wait_launch)
 
-# ====== MCCL utilities ======
-set_musa_source_properties(mccl_utils.cu)
-add_library(mccl_tool mccl_utils.cu)
+# ====== MCCL utilities (pure host code) ======
+add_library(mccl_tool mccl_utils.cpp)
 set_property(TARGET mccl_tool PROPERTY POSITION_INDEPENDENT_CODE ON)
 
 # ====== Python binding shared library ======

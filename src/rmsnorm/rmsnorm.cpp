@@ -10,33 +10,27 @@
 void reorder_rmsnorm(at::Tensor X, at::Tensor RX, at::Tensor RW, 
     int64_t BM, int64_t BN, int64_t rldn, at::Tensor RA){
 
-  // X: [bs, dim]
-  // RX: [bs, dim]
-  
   int bs = X.size(0);
   int dim = X.size(1);
 
   launch_reorder_rmsnorm_kernel(
-        reinterpret_cast<half *>(X.data_ptr<at::Half>()),
-        reinterpret_cast<half *>(RW.data_ptr<at::Half>()),
-        reinterpret_cast<half *>(RX.data_ptr<at::Half>()),
+        X.data_ptr<at::Half>(),
+        RW.data_ptr<at::Half>(),
+        RX.data_ptr<at::Half>(),
         bs, dim, BM, BN, rldn, 
         RA.data_ptr<int>()
     );
 }
 
 void rmsnorm(at::Tensor X, at::Tensor O, at::Tensor RW){
-  
-  // X: [bs, dim]
-  // RX: [bs, dim]
-  
+
   int bs = X.size(0);
   int dim = X.size(1);
 
   launch_rmsnorm_kernel(
-        reinterpret_cast<half *>(X.data_ptr<at::Half>()),
-        reinterpret_cast<half *>(RW.data_ptr<at::Half>()),
-        reinterpret_cast<half *>(O.data_ptr<at::Half>()),
+        X.data_ptr<at::Half>(),
+        RW.data_ptr<at::Half>(),
+        O.data_ptr<at::Half>(),
         bs, dim
     );
 }

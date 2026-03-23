@@ -8,6 +8,8 @@
 #include "mutlass/gemm/device/gemm_universal_adapter.h"
 #include "mutlass/gemm/kernel/gemm_universal.hpp"
 #include "mutlass/gemm/collective/collective_builder.hpp"
+#include "mutlass/gemm/dispatch_policy.hpp"
+#include "mutlass/epilogue/dispatch_policy.hpp"
 #include "mutlass/util/packed_stride.hpp"
 #include "mutlass/util/device_memory.h"
 
@@ -39,7 +41,7 @@ void mutlass_gemm_signal(int M, int N, int K, int ReLDN, int* CommThr,
     static constexpr int AlignmentA = 16 / sizeof(ElementA);  // 8
     static constexpr int AlignmentB = 16 / sizeof(ElementB);  // 8
 
-    using ArchTag   = arch::Mp22;
+    using ArchTag   = arch::Mp31;
     using OpClass   = arch::OpClassTensorOp;
     using TileShape = Shape<Int<TileM>, Int<TileN>, Int<TileK>>;
 
@@ -52,13 +54,13 @@ void mutlass_gemm_signal(int M, int N, int K, int ReLDN, int* CommThr,
         TileShape,
         Shape<_1, _1, _1>,
         gemm::collective::StageCountAuto,
-        gemm::collective::KernelScheduleAuto
+        gemm::KernelTme
     >::CollectiveOp;
 
     // Custom signal epilogue
     using StrideC = Stride<int, _1, int>;
     using StrideD = Stride<int, _1, int>;
-    using EpiSchedule = epilogue::collective::EpilogueScheduleAuto;
+    using EpiSchedule = epilogue::NoSmem;
 
     using CollectiveEpilogue = epilogue::collective::SignalEpilogue<
         StrideC, StrideD, EpiSchedule, TileM, TileN

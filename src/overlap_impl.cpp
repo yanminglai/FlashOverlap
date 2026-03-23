@@ -1,8 +1,3 @@
-// Suppress __CUDA__ to avoid c10::Half / MUSA __half conversion error
-// in PyTorch's Half-inl.h when compiled with mcc -x musa.
-#pragma push_macro("__CUDA__")
-#undef __CUDA__
-
 #include "mccl_utils.h"
 #include "wait_launch.h"
 
@@ -20,8 +15,6 @@
 #include <cstdio>
 
 #include "overlap_impl.h"
-
-#pragma pop_macro("__CUDA__")
 
 #define DIV_UP(x, y) (((x) + (y) - 1) / (y))
 #define MAX_GROUP_SIZE 64
