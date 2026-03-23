@@ -2,8 +2,6 @@
 
 #include <musa_fp16.h>
 #include <musa_runtime.h>
-#include <curand_kernel.h>
-#include <driver_functions.h>
 #include <stdio.h>
 
 #include "utils.h"
