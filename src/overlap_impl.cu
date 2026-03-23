@@ -19,7 +19,7 @@
 #define DIV_UP(x, y) (((x) + (y) - 1) / (y))
 #define MAX_GROUP_SIZE 64
 
-/// NIL Implementation: Overlap CUTLASS GEMM and MCCL AllReduce
+/// NIL Implementation: Overlap MUTlass GEMM and MCCL AllReduce
 OverlapImpl::OverlapImpl(){
 
 }
@@ -28,7 +28,7 @@ OverlapImpl::~OverlapImpl(){
 
 }
 
-void OverlapImpl::CutlassInit(){
+void OverlapImpl::MutlassInit(){
     this->gemm_stream = at::musa::getCurrentMUSAStream().stream();
 }
 

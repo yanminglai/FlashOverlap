@@ -23,7 +23,7 @@ class RowParallelLayer(nn.Module):
             return out
         elif self.comm_op == "reduce_scatter":
             cout = torch.empty((x.size(0) // dist.get_world_size(), self.weight.size(0)), 
-                dtype=torch.float16, device="cuda")
+                dtype=torch.float16, device="musa")
             dist.reduce_scatter_tensor(cout, out, group=self.tp_group)
             return cout
         else:
@@ -31,7 +31,7 @@ class RowParallelLayer(nn.Module):
 
 class OverlapRowParallelLayer(nn.Module):
     def __init__(self, rank: int, world_size: int, in_features: int, out_features: int, 
-        M: int, config: dict, comm_op: str, nccl_id):
+        M: int, config: dict, comm_op: str, mccl_id):
         super().__init__()
 
         assert comm_op in ["all_reduce", "reduce_scatter"], \
@@ -43,8 +43,8 @@ class OverlapRowParallelLayer(nn.Module):
         self.comm_op = comm_op
 
         self.overlap_class = torch.classes.flashoverlap_class.OverlapImpl()
-        self.overlap_class.nccl_init(rank, world_size, nccl_id)
-        self.overlap_class.cutlass_init()
+        self.overlap_class.mccl_init(rank, world_size, mccl_id)
+        self.overlap_class.mutlass_init()
         self.overlap_class.overlap_init()
 
         BM = config["BM"]
@@ -54,11 +54,11 @@ class OverlapRowParallelLayer(nn.Module):
 
         tm, tn = div_up(M, BM), div_up(out_features, BN)
         self.algo = config["Algo"]
-        self.counter = torch.zeros((1, tn), dtype=torch.int, device="cuda")
+        self.counter = torch.zeros((1, tn), dtype=torch.int, device="musa")
         self.reorder_array = reorder_indices(tm * tn, hint).reshape((tm, tn))
 
         self.cseg_cpu = torch.tensor(cseg, dtype=torch.int32) 
-        self.cseg_gpu = self.cseg_cpu.cuda(rank)
+        self.cseg_gpu = self.cseg_cpu.musa(rank)
 
         if comm_op == "reduce_scatter":
             self.row_array = generate_row_mapping(M, out_features, BM, BN, cseg, world_size)
@@ -67,16 +67,16 @@ class OverlapRowParallelLayer(nn.Module):
         
     def forward(self, x):
         if self.comm_op == "all_reduce":
-            out = torch.empty((x.size(0), self.weight.size(0)), dtype=torch.float16, device="cuda")
+            out = torch.empty((x.size(0), self.weight.size(0)), dtype=torch.float16, device="musa")
             self.overlap_class.gemm_allreduce_overlap(
                 x, self.weight, out, self.counter, self.reorder_array, 1, self.cseg_cpu, self.cseg_gpu, self.algo, False)
         elif self.comm_op == "reduce_scatter":
-            tmp = torch.empty((x.size(0), self.weight.size(0)), dtype=torch.float16, device="cuda")
-            out = torch.empty((x.size(0) // self.world_size, self.weight.size(0)), dtype=torch.float16, device="cuda")
+            tmp = torch.empty((x.size(0), self.weight.size(0)), dtype=torch.float16, device="musa")
+            out = torch.empty((x.size(0) // self.world_size, self.weight.size(0)), dtype=torch.float16, device="musa")
             self.overlap_class.gemm_reducescatter_overlap(
                 x, self.weight, tmp, out, self.counter, self.reorder_array, self.row_array, 
                 1, self.cseg_cpu, self.cseg_gpu, self.algo, False
             )
         else:
-            out = torch.empty((x.size(0), self.weight.size(0)), dtype=torch.float16, device="cuda")
+            out = torch.empty((x.size(0), self.weight.size(0)), dtype=torch.float16, device="musa")
         return out

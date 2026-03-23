@@ -23,9 +23,9 @@ def reorder_indices(S, hint):
     remaining_elements = [x for x in original if x not in hint]
     for i, element in enumerate(remaining_elements, start=len(hint)):
         new_order[element] = i
-    return torch.tensor(new_order, dtype=torch.int, device="cuda")
+    return torch.tensor(new_order, dtype=torch.int, device="musa")
 
-def generate_row_remap_array(M, N, BM, BN, S_list, world_size, device="cuda"):
+def generate_row_remap_array(M, N, BM, BN, S_list, world_size, device="musa"):
     total_tiles = (M * N) // (BM * BN)
     assert sum(S_list) == total_tiles, "sum(S_list) must equal total number of tiles"
     
@@ -51,29 +51,29 @@ def init_distributed():
     local_rank = int(os.environ['LOCAL_RANK'])
     world_size = int(os.environ['WORLD_SIZE'])
     
-    torch.cuda.set_device(local_rank)
+    torch.musa.set_device(local_rank)
     
     dist.init_process_group(
-        backend='nccl', 
+        backend='mccl', 
         init_method='env://',
         world_size=world_size,
         rank=rank
         )
     return rank, local_rank, world_size
 
-def generate_and_broadcast_nccl_id():
+def generate_and_broadcast_mccl_id():
     rank = dist.get_rank()
     
     if rank == 0:
-        nccl_id = torch.ops.flashoverlap_op.generate_nccl_id()
-        nccl_id_tsr = torch.tensor(nccl_id, device="cuda")
-        dist.broadcast(nccl_id_tsr, src=0)
+        mccl_id = torch.ops.flashoverlap_op.generate_mccl_id()
+        mccl_id_tsr = torch.tensor(mccl_id, device="musa")
+        dist.broadcast(mccl_id_tsr, src=0)
     else:
-        nccl_id_tsr = torch.zeros(16, dtype=torch.int64, device="cuda")
-        dist.broadcast(nccl_id_tsr, src=0)
-        nccl_id = nccl_id_tsr.cpu().tolist()
+        mccl_id_tsr = torch.zeros(16, dtype=torch.int64, device="musa")
+        dist.broadcast(mccl_id_tsr, src=0)
+        mccl_id = mccl_id_tsr.cpu().tolist()
     
-    return nccl_id
+    return mccl_id
 
 def perf_running(M: int, N: int, K: int, BM: int, BN: int, Algo: int, 
                cSeg: list, hint: list, comm_op: str):
@@ -81,28 +81,28 @@ def perf_running(M: int, N: int, K: int, BM: int, BN: int, Algo: int,
     local_rank = int(os.environ['LOCAL_RANK'])
     world_size = int(os.environ['WORLD_SIZE'])
     
-    torch.cuda.set_device(local_rank)
+    torch.musa.set_device(local_rank)
     
-    nccl_id = generate_and_broadcast_nccl_id()
+    mccl_id = generate_and_broadcast_mccl_id()
     
     gemm_class = torch.classes.flashoverlap_class.OverlapImpl()
-    gemm_class.nccl_init(rank, world_size, nccl_id)
-    gemm_class.cutlass_init()
+    gemm_class.mccl_init(rank, world_size, mccl_id)
+    gemm_class.mutlass_init()
     gemm_class.overlap_init()
     
     cSeg_CPU = torch.tensor(cSeg, dtype=torch.int32) 
-    cSeg_GPU = cSeg_CPU.cuda(local_rank)
+    cSeg_GPU = cSeg_CPU.musa(local_rank)
     
     TileNum = div_up(M, BM) * div_up(N, BN)
-    A = torch.empty((M, K), dtype=torch.float16, device="cuda").normal_(mean=0., std=0.5)
-    B = torch.empty((N, K), dtype=torch.float16, device="cuda").normal_(mean=0., std=0.5)
-    C = torch.empty((M, N), dtype=torch.float16, device="cuda")
+    A = torch.empty((M, K), dtype=torch.float16, device="musa").normal_(mean=0., std=0.5)
+    B = torch.empty((N, K), dtype=torch.float16, device="musa").normal_(mean=0., std=0.5)
+    C = torch.empty((M, N), dtype=torch.float16, device="musa")
     
-    MonitoredMatrix = torch.zeros(((N+BN-1)//BN), dtype=torch.int, device="cuda")
+    MonitoredMatrix = torch.zeros(((N+BN-1)//BN), dtype=torch.int, device="musa")
     ReorderedArray = reorder_indices(TileNum, hint).reshape(((M+BM-1)//BM, (N+BN-1)//BN))
     
     if comm_op == "reduce_scatter":
-        D = torch.empty((M // world_size, N), dtype=torch.float16, device="cuda")
+        D = torch.empty((M // world_size, N), dtype=torch.float16, device="musa")
         RowArray = generate_row_remap_array(M, N, BM, BN, cSeg, world_size)
     
     _warm_up = WARM_UP
@@ -116,13 +116,13 @@ def perf_running(M: int, N: int, K: int, BM: int, BN: int, Algo: int,
 
             gemm_class.gemm_allreduce(A, B, C, Algo)
 
-            start_event = [torch.cuda.Event(enable_timing=True) for i in range(_freq)]
-            end_event = [torch.cuda.Event(enable_timing=True) for i in range(_freq)]
+            start_event = [torch.musa.Event(enable_timing=True) for i in range(_freq)]
+            end_event = [torch.musa.Event(enable_timing=True) for i in range(_freq)]
             for i in range(_freq):
                 start_event[i].record()
                 gemm_class.gemm_allreduce(A, B, C, Algo)
                 end_event[i].record()
-            torch.cuda.synchronize()
+            torch.musa.synchronize()
             dur = torch.tensor([s.elapsed_time(e) for s, e in zip(start_event, end_event)], dtype=torch.float)
         elif comm_op == "reduce_scatter":
             for _ in range(_warm_up):
@@ -131,13 +131,13 @@ def perf_running(M: int, N: int, K: int, BM: int, BN: int, Algo: int,
             MonitoredMatrix[0] = 0
             gemm_class.gemm_reducescatter(A, B, C, D, Algo)
 
-            start_event = [torch.cuda.Event(enable_timing=True) for i in range(_freq)]
-            end_event = [torch.cuda.Event(enable_timing=True) for i in range(_freq)]
+            start_event = [torch.musa.Event(enable_timing=True) for i in range(_freq)]
+            end_event = [torch.musa.Event(enable_timing=True) for i in range(_freq)]
             for i in range(_freq):
                 start_event[i].record()
                 gemm_class.gemm_reducescatter(A, B, C, D, Algo)
                 end_event[i].record()
-            torch.cuda.synchronize()
+            torch.musa.synchronize()
             dur = torch.tensor([s.elapsed_time(e) for s, e in zip(start_event, end_event)], dtype=torch.float)
 
     else:
@@ -145,30 +145,30 @@ def perf_running(M: int, N: int, K: int, BM: int, BN: int, Algo: int,
             for _ in range(_warm_up):
                 gemm_class.gemm_allreduce_overlap(A, B, C, MonitoredMatrix, ReorderedArray, 1, cSeg_CPU, cSeg_GPU, Algo, False)
 
-            start_event = [torch.cuda.Event(enable_timing=True) for i in range(_freq)]
-            end_event = [torch.cuda.Event(enable_timing=True) for i in range(_freq)]
+            start_event = [torch.musa.Event(enable_timing=True) for i in range(_freq)]
+            end_event = [torch.musa.Event(enable_timing=True) for i in range(_freq)]
             for i in range(_freq):
                 start_event[i].record()
                 gemm_class.gemm_allreduce_overlap(A, B, C, MonitoredMatrix, ReorderedArray, 1, cSeg_CPU, cSeg_GPU, Algo, False)
                 end_event[i].record()
-            torch.cuda.synchronize()
+            torch.musa.synchronize()
             dur = torch.tensor([s.elapsed_time(e) for s, e in zip(start_event, end_event)], dtype=torch.float)
         elif comm_op == "reduce_scatter":
             for _ in range(_warm_up):
                 gemm_class.gemm_reducescatter_overlap(A, B, C, D, MonitoredMatrix, ReorderedArray, RowArray, 1, cSeg_CPU, cSeg_GPU, Algo, False)
 
-            start_event = [torch.cuda.Event(enable_timing=True) for i in range(_freq)]
-            end_event = [torch.cuda.Event(enable_timing=True) for i in range(_freq)]
+            start_event = [torch.musa.Event(enable_timing=True) for i in range(_freq)]
+            end_event = [torch.musa.Event(enable_timing=True) for i in range(_freq)]
             for i in range(_freq):
                 start_event[i].record()
                 gemm_class.gemm_reducescatter_overlap(A, B, C, D, MonitoredMatrix, ReorderedArray, RowArray, 1, cSeg_CPU, cSeg_GPU, Algo, False)
                 end_event[i].record()
-            torch.cuda.synchronize()
+            torch.musa.synchronize()
             dur = torch.tensor([s.elapsed_time(e) for s, e in zip(start_event, end_event)], dtype=torch.float)
         else:
             dur = torch.zeros((_freq))
     
-    local_time = torch.tensor([torch.mean(dur).item()], device='cuda')
+    local_time = torch.tensor([torch.mean(dur).item()], device='musa')
     dist.all_reduce(local_time, op=dist.ReduceOp.MAX)
     
     return local_time.item()
@@ -178,44 +178,44 @@ def perf_comm(M: int, N: int, comm_type: str):
     local_rank = int(os.environ['LOCAL_RANK'])
     world_size = int(os.environ['WORLD_SIZE'])
     
-    torch.cuda.set_device(local_rank)
+    torch.musa.set_device(local_rank)
     
-    nccl_id = generate_and_broadcast_nccl_id()
+    mccl_id = generate_and_broadcast_mccl_id()
     
     comm_class = torch.classes.flashoverlap_class.OverlapImpl()
-    comm_class.nccl_init(rank, world_size, nccl_id)
-    comm_class.cutlass_init()
+    comm_class.mccl_init(rank, world_size, mccl_id)
+    comm_class.mutlass_init()
     
-    C = torch.empty((M, N), dtype=torch.float16, device="cuda")
+    C = torch.empty((M, N), dtype=torch.float16, device="musa")
     if comm_type == "reduce_scatter":
-        D = torch.empty((M // world_size, N), dtype=torch.float16, device="cuda")
+        D = torch.empty((M // world_size, N), dtype=torch.float16, device="musa")
 
     if comm_type == "all_reduce":
         for _ in range(WARM_UP):
-            comm_class.nccl_allreduce(C)
-        start_event = [torch.cuda.Event(enable_timing=True) for i in range(REP)]
-        end_event = [torch.cuda.Event(enable_timing=True) for i in range(REP)]
+            comm_class.mccl_allreduce(C)
+        start_event = [torch.musa.Event(enable_timing=True) for i in range(REP)]
+        end_event = [torch.musa.Event(enable_timing=True) for i in range(REP)]
         for i in range(REP):
             start_event[i].record()
-            comm_class.nccl_allreduce(C)
+            comm_class.mccl_allreduce(C)
             end_event[i].record()
-        torch.cuda.synchronize()
+        torch.musa.synchronize()
         dur = torch.tensor([s.elapsed_time(e) for s, e in zip(start_event, end_event)], dtype=torch.float)
     elif comm_type == "reduce_scatter":
         for _ in range(WARM_UP):
-            comm_class.nccl_reducescatter(C)
-        start_event = [torch.cuda.Event(enable_timing=True) for i in range(REP)]
-        end_event = [torch.cuda.Event(enable_timing=True) for i in range(REP)]
+            comm_class.mccl_reducescatter(C)
+        start_event = [torch.musa.Event(enable_timing=True) for i in range(REP)]
+        end_event = [torch.musa.Event(enable_timing=True) for i in range(REP)]
         for i in range(REP):
             start_event[i].record()
-            comm_class.nccl_reducescatter(C)
+            comm_class.mccl_reducescatter(C)
             end_event[i].record()
-        torch.cuda.synchronize()
+        torch.musa.synchronize()
         dur = torch.tensor([s.elapsed_time(e) for s, e in zip(start_event, end_event)], dtype=torch.float)
     else:
         dur = torch.zeros((REP))
         
-    local_time = torch.tensor([torch.mean(dur).item()], device='cuda')
+    local_time = torch.tensor([torch.mean(dur).item()], device='musa')
     dist.all_reduce(local_time, op=dist.ReduceOp.MAX)
     
     return local_time.item()
@@ -225,51 +225,51 @@ def perf_baseline(M: int, N: int, K: int, comm_op: str):
     local_rank = int(os.environ['LOCAL_RANK'])
     world_size = int(os.environ['WORLD_SIZE'])
     
-    torch.cuda.set_device(local_rank)
+    torch.musa.set_device(local_rank)
     
-    nccl_id = generate_and_broadcast_nccl_id()
+    mccl_id = generate_and_broadcast_mccl_id()
     
-    A = torch.empty((M, K), dtype=torch.float16, device="cuda").normal_(mean=0., std=0.5)
-    B = torch.empty((N, K), dtype=torch.float16, device="cuda").normal_(mean=0., std=0.5)
-    C = torch.empty((M, N), dtype=torch.float16, device="cuda")
+    A = torch.empty((M, K), dtype=torch.float16, device="musa").normal_(mean=0., std=0.5)
+    B = torch.empty((N, K), dtype=torch.float16, device="musa").normal_(mean=0., std=0.5)
+    C = torch.empty((M, N), dtype=torch.float16, device="musa")
     
     if comm_op == "reduce_scatter":
-        D = torch.empty((M // world_size, N), dtype=torch.float16, device="cuda")
+        D = torch.empty((M // world_size, N), dtype=torch.float16, device="musa")
     
     gemm_comm = torch.classes.flashoverlap_class.BaselineImpl()
-    gemm_comm.nccl_init(rank, world_size, nccl_id)
-    gemm_comm.cublas_init()
+    gemm_comm.mccl_init(rank, world_size, mccl_id)
+    gemm_comm.mublas_init()
     
     if comm_op == "all_reduce":
         for _ in range(WARM_UP):
             gemm_comm.gemm_allreduce(A, B, C)
-        start_event = [torch.cuda.Event(enable_timing=True) for i in range(REP)]
-        end_event = [torch.cuda.Event(enable_timing=True) for i in range(REP)]
+        start_event = [torch.musa.Event(enable_timing=True) for i in range(REP)]
+        end_event = [torch.musa.Event(enable_timing=True) for i in range(REP)]
         for i in range(REP):
             start_event[i].record()
-            # torch.cuda.cudart().cudaProfilerStart()
+            # torch.musa.musart().musaProfilerStart()
             gemm_comm.gemm_allreduce(A, B, C)
-            # torch.cuda.cudart().cudaProfilerStop()
+            # torch.musa.musart().musaProfilerStop()
             end_event[i].record()
-        torch.cuda.synchronize()
+        torch.musa.synchronize()
         dur = torch.tensor([s.elapsed_time(e) for s, e in zip(start_event, end_event)], dtype=torch.float)
     elif comm_op == "reduce_scatter":
         for _ in range(WARM_UP):
             gemm_comm.gemm_reducescatter(A, B, C, D)
-        start_event = [torch.cuda.Event(enable_timing=True) for i in range(REP)]
-        end_event = [torch.cuda.Event(enable_timing=True) for i in range(REP)]
+        start_event = [torch.musa.Event(enable_timing=True) for i in range(REP)]
+        end_event = [torch.musa.Event(enable_timing=True) for i in range(REP)]
         for i in range(REP):
             start_event[i].record()
-            # torch.cuda.cudart().cudaProfilerStart()
+            # torch.musa.musart().musaProfilerStart()
             gemm_comm.gemm_reducescatter(A, B, C, D)
-            # torch.cuda.cudart().cudaProfilerStop()
+            # torch.musa.musart().musaProfilerStop()
             end_event[i].record()
-        torch.cuda.synchronize()
+        torch.musa.synchronize()
         dur = torch.tensor([s.elapsed_time(e) for s, e in zip(start_event, end_event)], dtype=torch.float)
     else:
         dur = torch.zeros((REP))
     
-    local_time = torch.tensor([torch.mean(dur).item()], device='cuda')
+    local_time = torch.tensor([torch.mean(dur).item()], device='musa')
     dist.all_reduce(local_time, op=dist.ReduceOp.MAX)
     
     return local_time.item()
@@ -279,8 +279,8 @@ def main(args):
     
     rank = int(os.environ.get('RANK', 0))
     
-    device = torch.cuda.current_device()
-    props = torch.cuda.get_device_properties(device)
+    device = torch.musa.current_device()
+    props = torch.musa.get_device_properties(device)
     gpu_name = props.name[7:11].lower()
     sm_count = props.multi_processor_count
     wave_size = sm_count - 2

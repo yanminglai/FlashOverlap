@@ -19,13 +19,13 @@ def create_tp_group(world_size, rank, tp_size):
     tp_group = dist.new_group(ranks=ranks)
     return tp_group
 
-def per_gpu_process(rank, world_size, nccl_id, M, N, K, config):
-    torch.cuda.set_device(rank)
+def per_gpu_process(rank, world_size, mccl_id, M, N, K, config):
+    torch.musa.set_device(rank)
 
-    A0 = torch.ones((M, K), dtype=torch.float16, device="cuda").normal_(mean=0., std=0.5)
+    A0 = torch.ones((M, K), dtype=torch.float16, device="musa").normal_(mean=0., std=0.5)
     A1 = reorder_rows_by_world_size(A0, world_size)
-    B = torch.ones((N, K), dtype=torch.float16, device="cuda").normal_(mean=0., std=0.5)
-    W = torch.ones((N), dtype=torch.float16, device="cuda").normal_(mean=0., std=0.5)
+    B = torch.ones((N, K), dtype=torch.float16, device="musa").normal_(mean=0., std=0.5)
+    W = torch.ones((N), dtype=torch.float16, device="musa").normal_(mean=0., std=0.5)
     
     rmsnorm_layer = RMSNorm(N)
     rmsnorm_layer.weight = nn.Parameter(W)
@@ -37,15 +37,15 @@ def per_gpu_process(rank, world_size, nccl_id, M, N, K, config):
     os.environ["WORLD_SIZE"] = str(world_size)
     os.environ["MASTER_ADDR"] = "127.0.0.1"
     os.environ["MASTER_PORT"] = "23456"
-    dist.init_process_group(backend="nccl", init_method="env://")
+    dist.init_process_group(backend="mccl", init_method="env://")
     tp_group = create_tp_group(world_size, rank, world_size)
     linear_layer = RowParallelLayer(K, N, "reduce_scatter", tp_group)
     linear_layer.weight = nn.Parameter(B)
     overlap_linear_layer = OverlapRowParallelLayer(
-        rank, world_size, K, N, M, config, "reduce_scatter", nccl_id)
+        rank, world_size, K, N, M, config, "reduce_scatter", mccl_id)
     overlap_linear_layer.weight = nn.Parameter(B)
 
-    torch.cuda.synchronize()
+    torch.musa.synchronize()
     x1 = linear_layer(A1)
     x2 = overlap_linear_layer(A0)
 
@@ -65,7 +65,7 @@ def per_gpu_process(rank, world_size, nccl_id, M, N, K, config):
     print("Absolute difference:", diff[max_idx_unravel].item())
 
     all_close = torch.allclose(y1, y2, atol=5e-2, rtol=5e-2)
-    torch.cuda.synchronize()
+    torch.musa.synchronize()
     dist.destroy_process_group()
     
     print("[GEMM+ReduceScatter+RMSNorm] all close : ", all_close)
@@ -77,19 +77,19 @@ def main():
     parser.add_argument('--n', type=int, default=4096)
     args = parser.parse_args()
 
-    world_size = torch.cuda.device_count()
+    world_size = torch.musa.device_count()
     if world_size < 2:
         raise RuntimeError("At least 2 GPUs are required for this program.")
 
-    # Use the custom NCCL initialization wrapper to get a unique NCCL ID
-    # nccl_id = NcclInit()
-    nccl_id = torch.ops.flashoverlap_op.generate_nccl_id()
-    torch.cuda.synchronize()
+    # Use the custom MCCL initialization wrapper to get a unique MCCL ID
+    # mccl_id = NcclInit()
+    mccl_id = torch.ops.flashoverlap_op.generate_mccl_id()
+    torch.musa.synchronize()
 
-    print(f"NCCL ID generated: {nccl_id[0]}")
+    print(f"MCCL ID generated: {mccl_id[0]}")
 
-    device = torch.cuda.current_device()
-    props = torch.cuda.get_device_properties(device)
+    device = torch.musa.current_device()
+    props = torch.musa.get_device_properties(device)
     gpu_name = props.name[7:11].lower()
     config_file = f'../configs/m{args.m}n{args.n}k{args.k}_{gpu_name}.json'
 
@@ -99,7 +99,7 @@ def main():
     # Spawn processes
     mp.spawn(
             per_gpu_process,
-            args=(world_size, nccl_id, args.m, args.n, args.k, config),
+            args=(world_size, mccl_id, args.m, args.n, args.k, config),
             nprocs=world_size
         )
 

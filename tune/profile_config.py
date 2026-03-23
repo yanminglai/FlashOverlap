@@ -14,25 +14,25 @@ from heapq import nsmallest
 torch.ops.load_library("../build/lib/libst_pybinding.so")
 
 def perf_wrapped_gemm(M: int, N: int, K: int, Algo: int):
-    cutlass_gemm = torch.classes.flashoverlap_class.OverlapImpl()
-    cutlass_gemm.cutlass_init()
+    gemm_class = torch.classes.flashoverlap_class.OverlapImpl()
+    gemm_class.mutlass_init()
 
-    A = torch.empty((M, K), dtype=torch.float16, device="cuda").normal_(mean=0., std=0.5)
-    B = torch.empty((N, K), dtype=torch.float16, device="cuda").normal_(mean=0., std=0.5)
-    C = torch.empty((M, N), dtype=torch.float16, device="cuda")
+    A = torch.empty((M, K), dtype=torch.float16, device="musa").normal_(mean=0., std=0.5)
+    B = torch.empty((N, K), dtype=torch.float16, device="musa").normal_(mean=0., std=0.5)
+    C = torch.empty((M, N), dtype=torch.float16, device="musa")
 
     for _ in range(10):
-        cutlass_gemm.cutlass_gemm(A, B, C, Algo)
-    start_event = [torch.cuda.Event(enable_timing=True) for i in range(100)]
-    end_event = [torch.cuda.Event(enable_timing=True) for i in range(100)]
+        gemm_class.mutlass_gemm(A, B, C, Algo)
+    start_event = [torch.musa.Event(enable_timing=True) for i in range(100)]
+    end_event = [torch.musa.Event(enable_timing=True) for i in range(100)]
     for i in range(100):
         start_event[i].record()
-        cutlass_gemm.cutlass_gemm(A, B, C, Algo)
+        gemm_class.mutlass_gemm(A, B, C, Algo)
         end_event[i].record()
-    torch.cuda.synchronize()
-    cutlass_dur = torch.tensor([s.elapsed_time(e) for s, e in zip(start_event, end_event)], dtype=torch.float)
+    torch.musa.synchronize()
+    gemm_dur = torch.tensor([s.elapsed_time(e) for s, e in zip(start_event, end_event)], dtype=torch.float)
 
-    return torch.mean(cutlass_dur).item()
+    return torch.mean(gemm_dur).item()
 
 def read_algo_dict(file_path: str, key_tuple: tuple):
     if Path(file_path).exists():
@@ -55,8 +55,8 @@ def read_algo_dict(file_path: str, key_tuple: tuple):
         return new_index
 
 def save_json(M: int, N: int, K: int, bm_list, bn_list, idx_list, dur_list):
-    device = torch.cuda.current_device()
-    props = torch.cuda.get_device_properties(device)
+    device = torch.musa.current_device()
+    props = torch.musa.get_device_properties(device)
     gpu_name = props.name[7:11].lower()
     file_path = f'../configs/m{M}n{N}k{K}_{gpu_name}.json'
     if Path(file_path).exists():

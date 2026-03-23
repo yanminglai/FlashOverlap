@@ -7,38 +7,38 @@ import matplotlib.pyplot as plt
 
 torch.ops.load_library("../build/lib/libst_pybinding.so")
 
-# Function to initialize NCCL in each process
-def perf_comm_process(rank, world_size, nccl_id, M, N, comm_op, result_dict):
-    torch.cuda.set_device(rank)
+# Function to initialize MCCL in each process
+def perf_comm_process(rank, world_size, mccl_id, M, N, comm_op, result_dict):
+    torch.musa.set_device(rank)
 
     comm_class = torch.classes.flashoverlap_class.OverlapImpl()
 
-    comm_class.nccl_init(rank, world_size, nccl_id)
-    comm_class.cutlass_init()
+    comm_class.mccl_init(rank, world_size, mccl_id)
+    comm_class.mutlass_init()
 
-    C = torch.empty((M, N), dtype=torch.float16, device="cuda").normal_(mean=0., std=0.5)
+    C = torch.empty((M, N), dtype=torch.float16, device="musa").normal_(mean=0., std=0.5)
 
     if comm_op == "all_reduce":
         for _ in range(20):
-            comm_class.nccl_allreduce(C)
-        start_event = [torch.cuda.Event(enable_timing=True) for i in range(200)]
-        end_event = [torch.cuda.Event(enable_timing=True) for i in range(200)]
+            comm_class.mccl_allreduce(C)
+        start_event = [torch.musa.Event(enable_timing=True) for i in range(200)]
+        end_event = [torch.musa.Event(enable_timing=True) for i in range(200)]
         for i in range(200):
             start_event[i].record()
-            comm_class.nccl_allreduce(C)
+            comm_class.mccl_allreduce(C)
             end_event[i].record()
-        torch.cuda.synchronize()
+        torch.musa.synchronize()
         dur = torch.tensor([s.elapsed_time(e) for s, e in zip(start_event, end_event)], dtype=torch.float)
     elif comm_op == "reduce_scatter":
         for _ in range(20):
-            comm_class.nccl_reducescatter(C)
-        start_event = [torch.cuda.Event(enable_timing=True) for i in range(200)]
-        end_event = [torch.cuda.Event(enable_timing=True) for i in range(200)]
+            comm_class.mccl_reducescatter(C)
+        start_event = [torch.musa.Event(enable_timing=True) for i in range(200)]
+        end_event = [torch.musa.Event(enable_timing=True) for i in range(200)]
         for i in range(200):
             start_event[i].record()
-            comm_class.nccl_reducescatter(C)
+            comm_class.mccl_reducescatter(C)
             end_event[i].record()
-        torch.cuda.synchronize()
+        torch.musa.synchronize()
         dur = torch.tensor([s.elapsed_time(e) for s, e in zip(start_event, end_event)], dtype=torch.float)
     else:
         dur = 0
@@ -46,13 +46,13 @@ def perf_comm_process(rank, world_size, nccl_id, M, N, comm_op, result_dict):
     result_dict[rank] = torch.mean(dur).item()
 
 def perf_comm(M: int, N: int, comm_op: str):
-    world_size = torch.cuda.device_count()
+    world_size = torch.musa.device_count()
     if world_size < 2:
         raise RuntimeError("At least 2 GPUs are required!")
     
-    nccl_id = torch.ops.flashoverlap_op.generate_nccl_id()
-    torch.cuda.synchronize()
-    # print(f"NCCL ID generated: {nccl_id[0]}")
+    mccl_id = torch.ops.flashoverlap_op.generate_mccl_id()
+    torch.musa.synchronize()
+    # print(f"MCCL ID generated: {mccl_id[0]}")
 
     manager = mp.Manager()
     result_dict = manager.dict()
@@ -60,7 +60,7 @@ def perf_comm(M: int, N: int, comm_op: str):
     # get the all reduce time
     mp.spawn(
             perf_comm_process,
-            args=(world_size, nccl_id, M, N, comm_op, result_dict),
+            args=(world_size, mccl_id, M, N, comm_op, result_dict),
             nprocs=world_size
         )
 
@@ -68,7 +68,7 @@ def perf_comm(M: int, N: int, comm_op: str):
 
 # Define the main function
 def main():
-    world_size = torch.cuda.device_count()
+    world_size = torch.musa.device_count()
 
     parser = argparse.ArgumentParser()
     parser.add_argument('--comm_op', type=str, default="all_reduce")
@@ -80,7 +80,7 @@ def main():
     comm_array = torch.zeros((size_len, 2))
     for i, size in enumerate(data_sizes):
         # 创建输入张量（torch.float16）
-        input_data = torch.randn(size, dtype=torch.float16, device='cuda')
+        input_data = torch.randn(size, dtype=torch.float16, device='musa')
 
         avg_time = perf_comm(1024, size // 1024, args.comm_op)
         

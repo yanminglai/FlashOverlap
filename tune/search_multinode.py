@@ -14,36 +14,36 @@ def init_distributed():
     local_rank = int(os.environ['LOCAL_RANK'])
     world_size = int(os.environ['WORLD_SIZE'])
     
-    torch.cuda.set_device(local_rank)
+    torch.musa.set_device(local_rank)
     
     dist.init_process_group(
-        backend='nccl', 
+        backend='mccl', 
         init_method='env://',
         world_size=world_size,
         rank=rank
         )
     return rank, local_rank, world_size
 
-def generate_and_broadcast_nccl_id():
+def generate_and_broadcast_mccl_id():
     rank = dist.get_rank()
     
     if rank == 0:
-        nccl_id = torch.ops.flashoverlap_op.generate_nccl_id()
-        nccl_id_tsr = torch.tensor(nccl_id, device="cuda")
-        dist.broadcast(nccl_id_tsr, src=0)
+        mccl_id = torch.ops.flashoverlap_op.generate_mccl_id()
+        mccl_id_tsr = torch.tensor(mccl_id, device="musa")
+        dist.broadcast(mccl_id_tsr, src=0)
     else:
-        nccl_id_tsr = torch.zeros(16, dtype=torch.int64, device="cuda")
-        dist.broadcast(nccl_id_tsr, src=0)
-        nccl_id = nccl_id_tsr.cpu().tolist()
+        mccl_id_tsr = torch.zeros(16, dtype=torch.int64, device="musa")
+        dist.broadcast(mccl_id_tsr, src=0)
+        mccl_id = mccl_id_tsr.cpu().tolist()
     
-    return nccl_id
+    return mccl_id
 
 def div_up(x: int, y: int):
     return (x + y - 1) // y
 
 def load_json(M: int, N: int, K: int):
-    device = torch.cuda.current_device()
-    props = torch.cuda.get_device_properties(device)
+    device = torch.musa.current_device()
+    props = torch.musa.get_device_properties(device)
     gpu_name = props.name[7:11].lower()
     file_path = f'../configs/m{M}n{N}k{K}_{gpu_name}.json'
     
@@ -55,8 +55,8 @@ def load_json(M: int, N: int, K: int):
     return data["BM"], data["BN"], data["dur"], data["Algo"]
 
 def save_solution(M: int, N: int, K: int, BM: int, BN: int, gemm_dur: float, Algo: int, hint: list, cSeg: list):
-    device = torch.cuda.current_device()
-    props = torch.cuda.get_device_properties(device)
+    device = torch.musa.current_device()
+    props = torch.musa.get_device_properties(device)
     gpu_name = props.name[7:11].lower()
     file_path = f'../configs/m{M}n{N}k{K}_{gpu_name}.json'
     
@@ -74,7 +74,7 @@ def save_solution(M: int, N: int, K: int, BM: int, BN: int, gemm_dur: float, Alg
         json.dump(data, f, indent=4)
 
 def generate_row_remap_array(
-    M, N, BM, BN, S_list, world_size, device="cuda"
+    M, N, BM, BN, S_list, world_size, device="musa"
 ):
     total_tiles = (M * N) // (BM * BN)
     assert sum(S_list) == total_tiles, "sum(S_list) must equal total number of tiles"
@@ -108,11 +108,11 @@ def compute_hint(M: int, N: int, K: int,
     local_rank = int(os.environ['LOCAL_RANK'])
     world_size = int(os.environ['WORLD_SIZE'])
 
-    nccl_id = generate_and_broadcast_nccl_id()
+    mccl_id = generate_and_broadcast_mccl_id()
 
     gemm_class = torch.classes.flashoverlap_class.OverlapImpl()
-    gemm_class.nccl_init(rank, world_size, nccl_id)
-    gemm_class.cutlass_init()
+    gemm_class.mccl_init(rank, world_size, mccl_id)
+    gemm_class.mutlass_init()
     gemm_class.overlap_init()
 
     TileNum = div_up(M, BM) * div_up(N, BN)
@@ -124,17 +124,17 @@ def compute_hint(M: int, N: int, K: int,
         cSeg = cSeg + [this_seg]
 
     cSeg_CPU = torch.tensor(cSeg, dtype=torch.int32) 
-    cSeg_GPU = cSeg_CPU.cuda(local_rank)
+    cSeg_GPU = cSeg_CPU.musa(local_rank)
     
-    A = torch.empty((M, K), dtype=torch.float16, device="cuda").normal_(mean=0., std=0.5)
-    B = torch.empty((N, K), dtype=torch.float16, device="cuda").normal_(mean=0., std=0.5)
-    C = torch.empty((M, N), dtype=torch.float16, device="cuda")
+    A = torch.empty((M, K), dtype=torch.float16, device="musa").normal_(mean=0., std=0.5)
+    B = torch.empty((N, K), dtype=torch.float16, device="musa").normal_(mean=0., std=0.5)
+    C = torch.empty((M, N), dtype=torch.float16, device="musa")
 
-    MonitoredMatrix = torch.zeros(((M+BM-1)//BM + 1, (N+BN-1)//BN), dtype=torch.int, device="cuda") # TODO: We should put it in class
-    ReorderedArray = torch.arange(0, TileNum, dtype=torch.int, device="cuda").reshape(((M+BM-1)//BM, (N+BN-1)//BN))
+    MonitoredMatrix = torch.zeros(((M+BM-1)//BM + 1, (N+BN-1)//BN), dtype=torch.int, device="musa") # TODO: We should put it in class
+    ReorderedArray = torch.arange(0, TileNum, dtype=torch.int, device="musa").reshape(((M+BM-1)//BM, (N+BN-1)//BN))
 
     if comm_op == "reduce_scatter":
-        D = torch.empty((M // world_size, N), dtype=torch.float16, device="cuda")
+        D = torch.empty((M // world_size, N), dtype=torch.float16, device="musa")
         RowArray = generate_row_remap_array(M, N, BM, BN, cSeg, world_size)
 
     _warm_up = 100
@@ -144,7 +144,7 @@ def compute_hint(M: int, N: int, K: int,
         for _ in range(_warm_up):
             gemm_class.gemm_allreduce_overlap(A, B, C, MonitoredMatrix, ReorderedArray, 1, cSeg_CPU, cSeg_GPU, Algo, True)
         
-        samples = torch.empty((_sample, TileNum), dtype=torch.int, device="cuda")
+        samples = torch.empty((_sample, TileNum), dtype=torch.int, device="musa")
         for i in range(_sample):
             MonitoredMatrix[0] = 0
             gemm_class.gemm_allreduce_overlap(A, B, C, MonitoredMatrix, ReorderedArray, 1, cSeg_CPU, cSeg_GPU, Algo, True)
@@ -154,7 +154,7 @@ def compute_hint(M: int, N: int, K: int,
         for _ in range(_warm_up):
             gemm_class.gemm_reducescatter_overlap(A, B, C, D, MonitoredMatrix, ReorderedArray, RowArray, 1, cSeg_CPU, cSeg_GPU, Algo, True)
         
-        samples = torch.empty((_sample, TileNum), dtype=torch.int, device="cuda")
+        samples = torch.empty((_sample, TileNum), dtype=torch.int, device="musa")
         for i in range(_sample):
             MonitoredMatrix[0] = 0
             gemm_class.gemm_reducescatter_overlap(A, B, C, D, MonitoredMatrix, ReorderedArray, RowArray, 1, cSeg_CPU, cSeg_GPU, Algo, True)
@@ -176,8 +176,8 @@ def compute_hint(M: int, N: int, K: int,
 
         hint = hint + index[0].tolist()
         
-    local_consistent = torch.tensor([1 if is_consistency else 0], device='cuda')
-    global_consistent = torch.tensor([0], device='cuda')
+    local_consistent = torch.tensor([1 if is_consistency else 0], device='musa')
+    global_consistent = torch.tensor([0], device='musa')
     
     dist.all_reduce(local_consistent, op=dist.ReduceOp.MIN, async_op=False)
     global_consistent = local_consistent
@@ -194,27 +194,27 @@ def perf_running(M: int, N: int, K: int,
     local_rank = int(os.environ['LOCAL_RANK'])
     world_size = int(os.environ['WORLD_SIZE'])
 
-    nccl_id = generate_and_broadcast_nccl_id()
+    mccl_id = generate_and_broadcast_mccl_id()
 
     gemm_class = torch.classes.flashoverlap_class.OverlapImpl()
-    gemm_class.nccl_init(rank, world_size, nccl_id)
-    gemm_class.cutlass_init()
+    gemm_class.mccl_init(rank, world_size, mccl_id)
+    gemm_class.mutlass_init()
     gemm_class.overlap_init()
 
     cSeg_CPU = torch.tensor(cSeg, dtype=torch.int32) 
-    cSeg_GPU = cSeg_CPU.cuda(local_rank)
+    cSeg_GPU = cSeg_CPU.musa(local_rank)
 
     TileNum = div_up(M, BM) * div_up(N, BN)
 
-    A = torch.empty((M, K), dtype=torch.float16, device="cuda").normal_(mean=0., std=0.5)
-    B = torch.empty((N, K), dtype=torch.float16, device="cuda").normal_(mean=0., std=0.5)
-    C = torch.empty((M, N), dtype=torch.float16, device="cuda")
+    A = torch.empty((M, K), dtype=torch.float16, device="musa").normal_(mean=0., std=0.5)
+    B = torch.empty((N, K), dtype=torch.float16, device="musa").normal_(mean=0., std=0.5)
+    C = torch.empty((M, N), dtype=torch.float16, device="musa")
 
-    MonitoredMatrix = torch.zeros(((N+BN-1)//BN), dtype=torch.int, device="cuda")
+    MonitoredMatrix = torch.zeros(((N+BN-1)//BN), dtype=torch.int, device="musa")
     ReorderedArray = reorder_indices(TileNum, hint).reshape(((M+BM-1)//BM, (N+BN-1)//BN))
 
     if comm_op == "reduce_scatter":
-        D = torch.empty((M // world_size, N), dtype=torch.float16, device="cuda")
+        D = torch.empty((M // world_size, N), dtype=torch.float16, device="musa")
         RowArray = generate_row_remap_array(M, N, BM, BN, cSeg, world_size)
     
     _warm_up = 20
@@ -228,13 +228,13 @@ def perf_running(M: int, N: int, K: int,
 
             gemm_class.gemm_allreduce(A, B, C, Algo)
 
-            start_event = [torch.cuda.Event(enable_timing=True) for i in range(_freq)]
-            end_event = [torch.cuda.Event(enable_timing=True) for i in range(_freq)]
+            start_event = [torch.musa.Event(enable_timing=True) for i in range(_freq)]
+            end_event = [torch.musa.Event(enable_timing=True) for i in range(_freq)]
             for i in range(_freq):
                 start_event[i].record()
                 gemm_class.gemm_allreduce(A, B, C, Algo)
                 end_event[i].record()
-            torch.cuda.synchronize()
+            torch.musa.synchronize()
             dur = torch.tensor([s.elapsed_time(e) for s, e in zip(start_event, end_event)], dtype=torch.float)
         elif comm_op == "reduce_scatter":
             for _ in range(_warm_up):
@@ -243,13 +243,13 @@ def perf_running(M: int, N: int, K: int,
             MonitoredMatrix[0] = 0
             gemm_class.gemm_reducescatter(A, B, C, D, Algo)
 
-            start_event = [torch.cuda.Event(enable_timing=True) for i in range(_freq)]
-            end_event = [torch.cuda.Event(enable_timing=True) for i in range(_freq)]
+            start_event = [torch.musa.Event(enable_timing=True) for i in range(_freq)]
+            end_event = [torch.musa.Event(enable_timing=True) for i in range(_freq)]
             for i in range(_freq):
                 start_event[i].record()
                 gemm_class.gemm_reducescatter(A, B, C, D, Algo)
                 end_event[i].record()
-            torch.cuda.synchronize()
+            torch.musa.synchronize()
             dur = torch.tensor([s.elapsed_time(e) for s, e in zip(start_event, end_event)], dtype=torch.float)
 
     else:
@@ -257,30 +257,30 @@ def perf_running(M: int, N: int, K: int,
             for _ in range(_warm_up):
                 gemm_class.gemm_allreduce_overlap(A, B, C, MonitoredMatrix, ReorderedArray, 1, cSeg_CPU, cSeg_GPU, Algo, False)
 
-            start_event = [torch.cuda.Event(enable_timing=True) for i in range(_freq)]
-            end_event = [torch.cuda.Event(enable_timing=True) for i in range(_freq)]
+            start_event = [torch.musa.Event(enable_timing=True) for i in range(_freq)]
+            end_event = [torch.musa.Event(enable_timing=True) for i in range(_freq)]
             for i in range(_freq):
                 start_event[i].record()
                 gemm_class.gemm_allreduce_overlap(A, B, C, MonitoredMatrix, ReorderedArray, 1, cSeg_CPU, cSeg_GPU, Algo, False)
                 end_event[i].record()
-            torch.cuda.synchronize()
+            torch.musa.synchronize()
             dur = torch.tensor([s.elapsed_time(e) for s, e in zip(start_event, end_event)], dtype=torch.float)
         elif comm_op == "reduce_scatter":
             for _ in range(_warm_up):
                 gemm_class.gemm_reducescatter_overlap(A, B, C, D, MonitoredMatrix, ReorderedArray, RowArray, 1, cSeg_CPU, cSeg_GPU, Algo, False)
 
-            start_event = [torch.cuda.Event(enable_timing=True) for i in range(_freq)]
-            end_event = [torch.cuda.Event(enable_timing=True) for i in range(_freq)]
+            start_event = [torch.musa.Event(enable_timing=True) for i in range(_freq)]
+            end_event = [torch.musa.Event(enable_timing=True) for i in range(_freq)]
             for i in range(_freq):
                 start_event[i].record()
                 gemm_class.gemm_reducescatter_overlap(A, B, C, D, MonitoredMatrix, ReorderedArray, RowArray, 1, cSeg_CPU, cSeg_GPU, Algo, False)
                 end_event[i].record()
-            torch.cuda.synchronize()
+            torch.musa.synchronize()
             dur = torch.tensor([s.elapsed_time(e) for s, e in zip(start_event, end_event)], dtype=torch.float)
         else:
             dur = torch.zeros((_freq))
 
-    local_time = torch.tensor([torch.mean(dur).item()], device='cuda')
+    local_time = torch.tensor([torch.mean(dur).item()], device='musa')
     dist.all_reduce(local_time, op=dist.ReduceOp.MAX)
     
     return local_time.item()
@@ -311,8 +311,8 @@ def interpolate_latency(samples, x, comm_op):
 def predict_lat(M: int, N: int, gemm_dur: float, 
     comm_array: torch.Tensor, gp: list, tile_num: int, comm_op: str):
 
-    device = torch.cuda.current_device()
-    props = torch.cuda.get_device_properties(device)
+    device = torch.musa.current_device()
+    props = torch.musa.get_device_properties(device)
     sm_count = props.multi_processor_count
     
     acc_comm_dur = 0
@@ -354,7 +354,7 @@ def reorder_indices(S, hint):
     for i, element in enumerate(remaining_elements, start=len(hint)):
         new_order[element] = i
     
-    return torch.tensor(new_order, dtype=torch.int, device="cuda")
+    return torch.tensor(new_order, dtype=torch.int, device="musa")
 
 def integer_partitions(n):
     result = []
@@ -370,8 +370,8 @@ def integer_partitions(n):
 def exhaustive_search(M: int, N: int, K: int, 
                      comm_op: str):
     BM_list, BN_list, gemm_dur_list, Algo_list = load_json(M, N, K)
-    device = torch.cuda.current_device()
-    props = torch.cuda.get_device_properties(device)
+    device = torch.musa.current_device()
+    props = torch.musa.get_device_properties(device)
     sm_count = props.multi_processor_count
 
     hint = None
@@ -384,7 +384,7 @@ def exhaustive_search(M: int, N: int, K: int,
             M, N, K, BM, BN, Algo, (sm_count - 2), comm_op
         )
         if is_consistency:
-            hint_tsr = torch.tensor(hint, device='cuda')
+            hint_tsr = torch.tensor(hint, device='musa')
             dist.broadcast(hint_tsr, src=0)
             hint = hint_tsr.cpu().tolist()
             break
@@ -424,8 +424,8 @@ def fast_search(M: int, N: int, K: int, comm_array: torch.Tensor, comm_op: str):
     BM_list, BN_list, gemm_dur_list, Algo_list = load_json(M, N, K)
 
     # get the SM count
-    device = torch.cuda.current_device()
-    props = torch.cuda.get_device_properties(device)
+    device = torch.musa.current_device()
+    props = torch.musa.get_device_properties(device)
     sm_count = props.multi_processor_count
 
     hint = None
@@ -444,7 +444,7 @@ def fast_search(M: int, N: int, K: int, comm_array: torch.Tensor, comm_op: str):
         is_consistency, hint = compute_hint(M, N, K, BM, BN, Algo, min_group_size * (sm_count - 2), comm_op)
 
         if is_consistency:
-            hint_tsr = torch.tensor(hint, device='cuda')
+            hint_tsr = torch.tensor(hint, device='musa')
             dist.broadcast(hint_tsr, src=0)
             hint = hint_tsr.cpu().tolist()
             break

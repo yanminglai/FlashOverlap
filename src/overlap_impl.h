@@ -13,7 +13,7 @@ class OverlapImpl : public torch::CustomClassHolder {
         OverlapImpl();
         ~OverlapImpl();
 
-        void CutlassInit();
+        void MutlassInit();
         void McclInit(const int64_t tp_rank, const int64_t tp_size, const std::vector<int64_t> tp_id);
         void OverlapInit();
 

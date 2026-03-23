@@ -14,22 +14,22 @@ WARM_UP = 20
 REP = 200
 
 def init_distributed():
-    """Initialize distributed training using pre-generated NCCL ID"""
+    """Initialize distributed training using pre-generated MCCL ID"""
     rank = int(os.environ['RANK'])
     local_rank = int(os.environ['LOCAL_RANK'])
     world_size = int(os.environ['WORLD_SIZE'])
 
-    torch.cuda.set_device(local_rank)
+    torch.musa.set_device(local_rank)
 
     # Initialize process group with timeout
     try:
         dist.init_process_group(
-            backend="nccl",
+            backend="mccl",
             init_method="env://",
             world_size=world_size,
             rank=rank,
             timeout=torch.distributed.default_pg_timeout,  # Use default timeout
-            device_id=torch.device(f'cuda:{local_rank}')
+            device_id=torch.device(f'musa:{local_rank}')
         )
     except Exception as e:
         print(f"Rank {rank}: Failed to initialize process group: {e}")
@@ -40,41 +40,41 @@ def init_distributed():
 
 def perf_comm_test(M: int, N: int, comm_op: str):
     """Run communication performance test"""
-    # rank, local_rank, world_size, nccl_id = init_distributed()
+    # rank, local_rank, world_size, mccl_id = init_distributed()
     rank = int(os.environ['RANK'])
     local_rank = int(os.environ['LOCAL_RANK'])
     world_size = int(os.environ['WORLD_SIZE'])
-    torch.cuda.set_device(local_rank)
-    device = torch.device(f'cuda:{local_rank}')
+    torch.musa.set_device(local_rank)
+    device = torch.device(f'musa:{local_rank}')
     # print(rank, local_rank, world_size)
 
-    # Load NCCL ID from file (wait if not exists)
-    # nccl_id_path = "../configs/nccl_id.pt"
-    # while not os.path.exists(nccl_id_path):
+    # Load MCCL ID from file (wait if not exists)
+    # mccl_id_path = "../configs/mccl_id.pt"
+    # while not os.path.exists(mccl_id_path):
         # time.sleep(0.1)
-    # nccl_id = torch.load(nccl_id_path, weights_only=True)
+    # mccl_id = torch.load(mccl_id_path, weights_only=True)
     if rank == 0:
-        nccl_id = torch.ops.flashoverlap_op.generate_nccl_id()
-        nccl_id_tsr = torch.tensor(nccl_id, device=device)
-        dist.broadcast(nccl_id_tsr, src=0)                   
+        mccl_id = torch.ops.flashoverlap_op.generate_mccl_id()
+        mccl_id_tsr = torch.tensor(mccl_id, device=device)
+        dist.broadcast(mccl_id_tsr, src=0)                   
     else:
-        nccl_id_tsr = torch.zeros(16, dtype=torch.int64, device=device)
-        dist.broadcast(nccl_id_tsr, src=0)
-        nccl_id = nccl_id_tsr.cpu().tolist()
-    # print(nccl_id)
+        mccl_id_tsr = torch.zeros(16, dtype=torch.int64, device=device)
+        dist.broadcast(mccl_id_tsr, src=0)
+        mccl_id = mccl_id_tsr.cpu().tolist()
+    # print(mccl_id)
 
     comm_class = torch.classes.flashoverlap_class.OverlapImpl()
     dist.barrier()
-    comm_class.nccl_init(rank, world_size, nccl_id)
-    comm_class.cutlass_init()
+    comm_class.mccl_init(rank, world_size, mccl_id)
+    comm_class.mutlass_init()
 
     C = torch.empty((M, N), dtype=torch.float16, device=device).normal_(mean=0., std=0.5)
 
     # Warm up
     if comm_op == "all_reduce":
-        comm_func = comm_class.nccl_allreduce
+        comm_func = comm_class.mccl_allreduce
     elif comm_op == "reduce_scatter":
-        comm_func = comm_class.nccl_reducescatter
+        comm_func = comm_class.mccl_reducescatter
     else:
         raise ValueError(f"Unsupported comm_op: {comm_op}")
 
@@ -82,15 +82,15 @@ def perf_comm_test(M: int, N: int, comm_op: str):
         comm_func(C)
 
     # Timed runs
-    start_events = [torch.cuda.Event(enable_timing=True) for _ in range(REP)]
-    end_events = [torch.cuda.Event(enable_timing=True) for _ in range(REP)]
+    start_events = [torch.musa.Event(enable_timing=True) for _ in range(REP)]
+    end_events = [torch.musa.Event(enable_timing=True) for _ in range(REP)]
 
     for i in range(REP):
         start_events[i].record()
         comm_func(C)
         end_events[i].record()
 
-    torch.cuda.synchronize()
+    torch.musa.synchronize()
     durations = torch.tensor([s.elapsed_time(e) for s, e in zip(start_events, end_events)])
     avg_time = durations.mean().item()
 

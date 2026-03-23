@@ -19,19 +19,19 @@ void MublasInitWrapper(const c10::intrusive_ptr<T>& self){
 }
 
 template<typename T>
-void CutlassGemmAllReduceWrapper(const c10::intrusive_ptr<T>& self, 
+void MutlassGemmAllReduceWrapper(const c10::intrusive_ptr<T>& self, 
     at::Tensor A, at::Tensor B, at::Tensor C, int64_t Algo){
     self->GemmAllReduce(A, B, C, Algo);
 }
 
 template<typename T>
-void CutlassGemmReduceScatterWrapper(const c10::intrusive_ptr<T>& self, 
+void MutlassGemmReduceScatterWrapper(const c10::intrusive_ptr<T>& self, 
     at::Tensor A, at::Tensor B, at::Tensor C, at::Tensor D, int64_t Algo){
     self->GemmReduceScatter(A, B, C, D, Algo);
 }
 
 template<typename T>
-void CutlassAll2AllWrapper(const c10::intrusive_ptr<T>& self, 
+void MutlassAll2AllWrapper(const c10::intrusive_ptr<T>& self, 
     at::Tensor A, at::Tensor B, at::Tensor C, at::Tensor D, int64_t Algo, at::Tensor mLen_CPU){
     self->GemmAll2All(A, B, C, D, Algo, mLen_CPU);
 }
@@ -55,8 +55,8 @@ void GemmAll2AllWrapper(const c10::intrusive_ptr<T>& self,
 }
 
 template<typename T>
-void CutlassInitWrapper(const c10::intrusive_ptr<T>& self){
-    self->CutlassInit();
+void MutlassInitWrapper(const c10::intrusive_ptr<T>& self){
+    self->MutlassInit();
 }
 
 template<typename T>
@@ -66,7 +66,7 @@ void GemmWrapper(const c10::intrusive_ptr<T>& self,
 }
 
 template<typename T>
-void CutlassGemmWrapper(const c10::intrusive_ptr<T>& self, 
+void MutlassGemmWrapper(const c10::intrusive_ptr<T>& self, 
     at::Tensor A, at::Tensor B, at::Tensor C, int64_t Algo){
     self->Gemm(A, B, C, Algo);
 }
@@ -128,14 +128,14 @@ TORCH_LIBRARY(flashoverlap_class, m) {
     ;
     m.class_<OverlapImpl>("OverlapImpl")
         .def(torch::init())
-        .def("cutlass_init", &CutlassInitWrapper<OverlapImpl>)
-        .def("cutlass_gemm", &CutlassGemmWrapper<OverlapImpl>)
+        .def("mutlass_init", &MutlassInitWrapper<OverlapImpl>)
+        .def("mutlass_gemm", &MutlassGemmWrapper<OverlapImpl>)
         .def("gemm_allreduce_overlap", &AllReduceOverlapWrapper<OverlapImpl>)
         .def("gemm_reducescatter_overlap", &ReduceScatterOverlapWrapper<OverlapImpl>)
         .def("mccl_init", &McclInitWrapper<OverlapImpl>)
-        .def("gemm_allreduce", &CutlassGemmAllReduceWrapper<OverlapImpl>)
-        .def("gemm_reducescatter", &CutlassGemmReduceScatterWrapper<OverlapImpl>)
-        .def("gemm_all2all", &CutlassAll2AllWrapper<OverlapImpl>)
+        .def("gemm_allreduce", &MutlassGemmAllReduceWrapper<OverlapImpl>)
+        .def("gemm_reducescatter", &MutlassGemmReduceScatterWrapper<OverlapImpl>)
+        .def("gemm_all2all", &MutlassAll2AllWrapper<OverlapImpl>)
         .def("overlap_init", &OverlapInitWrapper<OverlapImpl>)
         .def("mccl_allreduce", &McclAllReduceWrapper<OverlapImpl>)
         .def("mccl_reducescatter", &McclReduceScatterWrapper<OverlapImpl>)

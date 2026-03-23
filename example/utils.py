@@ -19,10 +19,10 @@ def reorder_indices(S, hint):
     for i, element in enumerate(remaining_elements, start=len(hint)):
         new_order[element] = i
     
-    return torch.tensor(new_order, dtype=torch.int, device="cuda")
+    return torch.tensor(new_order, dtype=torch.int, device="musa")
 
 def generate_row_mapping(
-    M, N, BM, BN, S_list, world_size, device="cuda"
+    M, N, BM, BN, S_list, world_size, device="musa"
 ):
     total_tiles = (M * N) // (BM * BN)
     assert sum(S_list) == total_tiles, "sum(S_list) must equal total number of tiles"
