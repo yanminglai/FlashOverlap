@@ -13,15 +13,15 @@
 #define DIV_UP(x, y) (((x) + (y) - 1) / (y))
 #define MAX_GROUP_SIZE 16
 
-/// Baseline Implementation: cuBLAS for GEMM and MCCL for AllReduce
+/// Baseline Implementation: muBLAS for GEMM and MCCL for AllReduce
 BaselineImpl::BaselineImpl(){
-    cublasCreate(&this->my_handle);
+    mublasCreate(&this->my_handle);
     this->my_rank = 0;
     this->my_size = 1;
 }
 
 BaselineImpl::~BaselineImpl(){
-    cublasDestroy(this->my_handle);
+    mublasDestroy(this->my_handle);
     // mcclCommDestroy(this->comm);
 }
 
@@ -45,18 +45,18 @@ void BaselineImpl::GemmAllReduce(at::Tensor A, at::Tensor B, at::Tensor C){
     half* c_ptr = reinterpret_cast<half *>(C.data_ptr<at::Half>());
 
     // Launch GEMM
-    cublasGemmEx(this->my_handle, CUBLAS_OP_T, CUBLAS_OP_N, 
+    mublasGemmEx(this->my_handle, MUBLAS_OP_T, MUBLAS_OP_N, 
                     N, M, K,
                     (const void*)reinterpret_cast<half *>(&alpha_half),
                     (const void*)reinterpret_cast<half *>(B.data_ptr<at::Half>()),
-                    CUDA_R_16F, K, 
+                    MUSA_R_16F, K, 
                     (const void*)reinterpret_cast<half *>(A.data_ptr<at::Half>()), 
-                    CUDA_R_16F, K, 
+                    MUSA_R_16F, K, 
                     (const void*)reinterpret_cast<half *>(&beta_half),
                     (void*)reinterpret_cast<half *>(C.data_ptr<at::Half>()), 
-                    CUDA_R_16F, N,
-                    CUBLAS_COMPUTE_16F,
-                    CUBLAS_GEMM_DEFAULT_TENSOR_OP);
+                    MUSA_R_16F, N,
+                    MUBLAS_COMPUTE_16F,
+                    MUBLAS_GEMM_DEFAULT);
 
     // Launch AllReduce after GEMM
     MCCL_CHECK(mcclAllReduce((void *)c_ptr, (void *)c_ptr, (M * N), mcclFloat16, mcclSum, this->comm, this->my_stream));
@@ -88,18 +88,18 @@ void BaselineImpl::GemmReduceScatter(
     half* d_ptr = reinterpret_cast<half *>(D.data_ptr<at::Half>());
 
     // Launch GEMM
-    cublasGemmEx(this->my_handle, CUBLAS_OP_T, CUBLAS_OP_N, 
+    mublasGemmEx(this->my_handle, MUBLAS_OP_T, MUBLAS_OP_N, 
                     N, M, K,
                     (const void*)reinterpret_cast<half *>(&alpha_half),
                     (const void*)reinterpret_cast<half *>(B.data_ptr<at::Half>()),
-                    CUDA_R_16F, K, 
+                    MUSA_R_16F, K, 
                     (const void*)reinterpret_cast<half *>(A.data_ptr<at::Half>()), 
-                    CUDA_R_16F, K, 
+                    MUSA_R_16F, K, 
                     (const void*)reinterpret_cast<half *>(&beta_half),
                     (void*)reinterpret_cast<half *>(C.data_ptr<at::Half>()), 
-                    CUDA_R_16F, N,
-                    CUBLAS_COMPUTE_16F,
-                    CUBLAS_GEMM_DEFAULT_TENSOR_OP);
+                    MUSA_R_16F, N,
+                    MUBLAS_COMPUTE_16F,
+                    MUBLAS_GEMM_DEFAULT);
 
     // Launch ReduceScatter after GEMM
     size_t recvcount = (M * N) / this->my_size;
@@ -134,18 +134,18 @@ void BaselineImpl::GemmAll2All(at::Tensor A, at::Tensor B, at::Tensor C,
     half* d_ptr = reinterpret_cast<half *>(D.data_ptr<at::Half>());
 
     // Launch GEMM
-    cublasGemmEx(this->my_handle, CUBLAS_OP_T, CUBLAS_OP_N, 
+    mublasGemmEx(this->my_handle, MUBLAS_OP_T, MUBLAS_OP_N, 
                     N, M, K,
                     (const void*)reinterpret_cast<half *>(&alpha_half),
                     (const void*)reinterpret_cast<half *>(B.data_ptr<at::Half>()),
-                    CUDA_R_16F, K, 
+                    MUSA_R_16F, K, 
                     (const void*)reinterpret_cast<half *>(A.data_ptr<at::Half>()), 
-                    CUDA_R_16F, K, 
+                    MUSA_R_16F, K, 
                     (const void*)reinterpret_cast<half *>(&beta_half),
                     (void*)reinterpret_cast<half *>(C.data_ptr<at::Half>()), 
-                    CUDA_R_16F, N,
-                    CUBLAS_COMPUTE_16F,
-                    CUBLAS_GEMM_DEFAULT_TENSOR_OP);
+                    MUSA_R_16F, N,
+                    MUBLAS_COMPUTE_16F,
+                    MUBLAS_GEMM_DEFAULT);
 
     // Launch All2All after GEMM
     // First SEND
@@ -181,12 +181,11 @@ void BaselineImpl::McclInit(const int64_t tp_rank, const int64_t tp_size, const 
     MCCL_CHECK(mcclCommInitRank(&this->comm, this->my_size, tp_uid, this->my_rank));
 }
 
-void BaselineImpl::CublasInit(){
+void BaselineImpl::MublasInit(){
 
     // prepare for GEMM
     this->my_stream = at::musa::getCurrentMUSAStream().stream();
-    cublasSetStream(this->my_handle, this->my_stream);
-    cublasSetMathMode(this->my_handle, CUBLAS_TENSOR_OP_MATH);
+    mublasSetStream(this->my_handle, this->my_stream);
 }
 
 void BaselineImpl::Gemm(at::Tensor A, at::Tensor B, at::Tensor C){
@@ -195,26 +194,25 @@ void BaselineImpl::Gemm(at::Tensor A, at::Tensor B, at::Tensor C){
     int K = A.size(1);
     int N = B.size(0);
 
-    cublasHandle_t cublasH = at::cuda::getCurrentCUDABlasHandle();
-    cublasSetMathMode(cublasH, CUBLAS_TENSOR_OP_MATH);
+    mublasHandle_t mublasH = at::musa::getCurrentMUSABlasHandle();
 
     float alpha = 1.0f;
     float beta = 0.0f;
     half alpha_half = __float2half(alpha);
     half beta_half = __float2half(beta);
 
-    cublasGemmEx(cublasH, CUBLAS_OP_T, CUBLAS_OP_N, 
+    mublasGemmEx(mublasH, MUBLAS_OP_T, MUBLAS_OP_N, 
                     N, M, K,
                     (const void*)reinterpret_cast<half *>(&alpha_half), 
                     (const void*)reinterpret_cast<half *>(B.data_ptr<at::Half>()),
-                    CUDA_R_16F, K, 
+                    MUSA_R_16F, K, 
                     (const void*)reinterpret_cast<half *>(A.data_ptr<at::Half>()), 
-                    CUDA_R_16F, K,  
+                    MUSA_R_16F, K,  
                     (const void*)reinterpret_cast<half *>(&beta_half),
                     (void*)reinterpret_cast<half *>(C.data_ptr<at::Half>()), 
-                    CUDA_R_16F, N,
-                    CUBLAS_COMPUTE_16F,
-                    CUBLAS_GEMM_DEFAULT_TENSOR_OP);
+                    MUSA_R_16F, N,
+                    MUBLAS_COMPUTE_16F,
+                    MUBLAS_GEMM_DEFAULT);
 }
 
 void BaselineImpl::McclAllReduce(at::Tensor C){

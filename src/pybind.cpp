@@ -14,8 +14,8 @@ void McclInitWrapper(const c10::intrusive_ptr<T>& self,
 }
 
 template<typename T>
-void CublasInitWrapper(const c10::intrusive_ptr<T>& self){
-    self->CublasInit();
+void MublasInitWrapper(const c10::intrusive_ptr<T>& self){
+    self->MublasInit();
 }
 
 template<typename T>
@@ -117,11 +117,11 @@ TORCH_LIBRARY(flashoverlap_class, m) {
     m.class_<BaselineImpl>("BaselineImpl")
         .def(torch::init())
         .def("mccl_init", &McclInitWrapper<BaselineImpl>)
-        .def("cublas_init", &CublasInitWrapper<BaselineImpl>)
+        .def("mublas_init", &MublasInitWrapper<BaselineImpl>)
         .def("gemm_allreduce", &GemmAllReduceWrapper<BaselineImpl>)
         .def("gemm_reducescatter", &GemmReduceScatterWrapper<BaselineImpl>)
         .def("gemm_all2all", &GemmAll2AllWrapper<BaselineImpl>)
-        .def("cublas_gemm", &GemmWrapper<BaselineImpl>)
+        .def("mublas_gemm", &GemmWrapper<BaselineImpl>)
         .def("mccl_allreduce", &McclAllReduceWrapper<BaselineImpl>)
         .def("mccl_reducescatter", &McclReduceScatterWrapper<BaselineImpl>)
         .def("mccl_all2all", &McclAll2AllWrapper<BaselineImpl>)

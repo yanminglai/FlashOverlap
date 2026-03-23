@@ -2,7 +2,7 @@
 
 #include <mccl.h>
 #include <vector>
-#include <cublas_v2.h>
+#include <mublas.h>
 
 #include <ATen/ATen.h>
 #include "torch_musa/csrc/aten/musa/MUSAContext.h"
@@ -13,7 +13,7 @@ class BaselineImpl : public torch::CustomClassHolder {
         ~BaselineImpl();
 
         void McclInit(const int64_t tp_rank, const int64_t tp_size, const std::vector<int64_t> tp_id);
-        void CublasInit();
+        void MublasInit();
 
         void GemmAllReduce(at::Tensor A, at::Tensor B, at::Tensor C);
         void GemmReduceScatter(at::Tensor A, at::Tensor B, at::Tensor C, at::Tensor D);
@@ -29,6 +29,6 @@ class BaselineImpl : public torch::CustomClassHolder {
         int64_t my_rank;
         int64_t my_size;
 
-        cublasHandle_t my_handle;
+        mublasHandle_t my_handle;
         musaStream_t my_stream;
 };

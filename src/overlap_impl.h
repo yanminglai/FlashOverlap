@@ -2,7 +2,6 @@
 
 #include <mccl.h>
 #include <vector>
-#include <cublas_v2.h>
 
 #include <ATen/ATen.h>
 #include "torch_musa/csrc/aten/musa/MUSAContext.h"
