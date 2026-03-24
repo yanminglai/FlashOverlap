@@ -18,6 +18,8 @@ from RMSNorm import RMSNorm, ReorderRMSNorm
 from RowParallelLinear import RowParallelLayer, OverlapRowParallelLayer
 
 def dbg(msg):
+    if not os.getenv('FLASH_DEBUG'):
+        return
     rank = os.getenv('LOCAL_RANK', '?')
     print(f"[rank={rank}] {msg}", flush=True, file=sys.stderr)
 

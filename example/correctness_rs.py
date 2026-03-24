@@ -19,6 +19,8 @@ from RowParallelLinear import RowParallelLayer, OverlapRowParallelLayer
 from utils import reorder_rows_by_world_size
 
 def dbg(msg):
+    if not os.getenv('FLASH_DEBUG'):
+        return
     rank = os.getenv('LOCAL_RANK', '?')
     print(f"[rank={rank}] {msg}", flush=True, file=sys.stderr)
 

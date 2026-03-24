@@ -14,6 +14,8 @@ import matplotlib.pyplot as plt
 import os
 
 def dbg(msg):
+    if not os.getenv('FLASH_DEBUG'):
+        return
     rank = os.getenv('LOCAL_RANK', '?')
     print(f"[rank={rank}] {msg}", flush=True, file=sys.stderr)
 

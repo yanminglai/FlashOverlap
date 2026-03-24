@@ -15,6 +15,8 @@ import os
 import torch.distributed as dist
 
 def dbg(msg):
+    if not os.getenv('FLASH_DEBUG'):
+        return
     rank = os.getenv('LOCAL_RANK', '?')
     print(f"[rank={rank}] {msg}", flush=True, file=sys.stderr)
 
@@ -293,6 +295,33 @@ def perf_baseline(M: int, N: int, K: int, comm_op: str):
     dist.all_reduce(local_dur, op=dist.ReduceOp.MAX)
     return local_dur.item()
 
+def perf_mublas_gemm(M: int, N: int, K: int):
+    """Benchmark muBLAS standalone GEMM on current rank, return max duration."""
+    rank, world_size = _rank, _world_size
+
+    A = torch.empty((M, K), dtype=torch.float16, device="musa").normal_(mean=0., std=0.5)
+    B = torch.empty((N, K), dtype=torch.float16, device="musa").normal_(mean=0., std=0.5)
+    C = torch.empty((M, N), dtype=torch.float16, device="musa")
+
+    gemm_class = torch.classes.flashoverlap_class.BaselineImpl()
+    gemm_class.mublas_init()
+
+    for _ in range(WARM_UP):
+        gemm_class.mublas_gemm(A, B, C)
+    start_event = [torch.musa.Event(enable_timing=True) for i in range(REP)]
+    end_event = [torch.musa.Event(enable_timing=True) for i in range(REP)]
+    for i in range(REP):
+        start_event[i].record()
+        gemm_class.mublas_gemm(A, B, C)
+        end_event[i].record()
+    torch.musa.synchronize()
+    dur = torch.tensor([s.elapsed_time(e) for s, e in zip(start_event, end_event)], dtype=torch.float)
+
+    local_dur = torch.tensor([torch.mean(dur).item()], device="musa")
+    dist.all_reduce(local_dur, op=dist.ReduceOp.MAX)
+    return local_dur.item()
+
+
 def main():
     init_dist()
 
@@ -321,10 +350,12 @@ def main():
     tile_num = m // data["BM"] * n // data["BN"]
     wave_num = (tile_num + wave_size - 1) // wave_size
 
-    gemm_dur = data["dur"]
+    mutlass_gemm_dur = data["dur"]
 
+    dbg("Starting muBLAS GEMM benchmark...")
+    mublas_gemm_dur = perf_mublas_gemm(m, n, k)
     dbg("Starting comm benchmark...")
-    comm_dur = perf_comm(m, n, comm_op)
+    mccl_comm_dur = perf_comm(m, n, comm_op)
     dbg("Starting overlap benchmark...")
     overlap_dur = perf_running(m, n, k,
         data["BM"], data["BN"], data["Algo"], data["cSeg"], data["hint"], comm_op)
@@ -335,17 +366,18 @@ def main():
 
     if _rank == 0:
         print(f"""
-        {'Item':<20} {'Value':>15}
-        {'-----':<20} {'-----':>15}
-        {'m':<20} {m:>15}
-        {'n':<20} {n:>15}
-        {'k':<20} {k:>15}
-        {'tile_num':<20} {tile_num:>15}
-        {'gemm_dur (ms)':<20} {gemm_dur:>15.4f}
-        {'comm_dur (ms)':<20} {comm_dur:>15.4f}
-        {'baseline_dur (ms)':<20} {baseline_dur:>15.4f}
-        {'overlap_dur (ms)':<20} {overlap_dur:>15.4f}
-        {'speedup':<20} {speedup:>15.4f}
+        {'Item':<25} {'Value':>15}
+        {'-----':<25} {'-----':>15}
+        {'m':<25} {m:>15}
+        {'n':<25} {n:>15}
+        {'k':<25} {k:>15}
+        {'tile_num':<25} {tile_num:>15}
+        {'mutlass_gemm (ms)':<25} {mutlass_gemm_dur:>15.4f}
+        {'mublas_gemm (ms)':<25} {mublas_gemm_dur:>15.4f}
+        {'mccl_comm (ms)':<25} {mccl_comm_dur:>15.4f}
+        {'baseline (mublas+mccl)':<25} {baseline_dur:>15.4f}
+        {'overlap (mutlass+mccl)':<25} {overlap_dur:>15.4f}
+        {'speedup':<25} {speedup:>15.4f}
         """)
 
     dist.destroy_process_group()
