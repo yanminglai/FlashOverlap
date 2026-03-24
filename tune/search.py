@@ -1,18 +1,66 @@
 '''
-    Using multiprocessing for distributed running, 
-    please specify the GPUs via MUSA_VISIBLE_DEVICES:
-        e.g., MUSA_VISIBLE_DEVICES=0,1 python3 search.py --m 4096 --n 8192 --k 4096 --comm_op all_reduce
+    Using torchrun for distributed running:
+        e.g., MUSA_VISIBLE_DEVICES=0,1 torchrun --nproc_per_node=2 search.py --m 4096 --n 8192 --k 4096 --comm_op all_reduce
 '''
 
+import sys
 import torch
+import torch_musa
 import argparse
-import pandas as pd
 import json
+import os
 from pathlib import Path
-import torch.multiprocessing as mp
+import torch.distributed as dist
 import numpy as np
 
-torch.ops.load_library("../build/lib/libst_pybinding.so")
+def dbg(msg):
+    rank = os.getenv('LOCAL_RANK', '?')
+    print(f"[rank={rank}] {msg}", flush=True, file=sys.stderr)
+
+_script_dir = os.path.dirname(os.path.abspath(__file__))
+torch.ops.load_library(os.path.join(_script_dir, "../build/lib/libst_pybinding.so"))
+
+# Global distributed state
+_rank = None
+_local_rank = None
+_world_size = None
+
+
+def init_dist():
+    global _rank, _local_rank, _world_size
+    ip = os.getenv('MASTER_ADDR', '127.0.0.1')
+    port = int(os.getenv('MASTER_PORT', '29500'))
+    world_size = int(os.getenv('WORLD_SIZE', 1))
+    rank = int(os.getenv('RANK', 0))
+    local_rank = int(os.getenv('LOCAL_RANK', 0))
+    dist.init_process_group(
+        backend='mccl',
+        init_method=f'tcp://{ip}:{port}',
+        world_size=world_size,
+        rank=rank,
+    )
+    torch.musa.set_device(local_rank)
+    _rank = rank
+    _local_rank = local_rank
+    _world_size = world_size
+
+
+def _get_mccl_id():
+    """Generate MCCL ID on rank 0 and broadcast to all ranks."""
+    dbg("_get_mccl_id: enter")
+    device = torch.device(f'musa:{_local_rank}')
+    if _rank == 0:
+        dbg("_get_mccl_id: generating...")
+        mccl_id = torch.ops.flashoverlap_op.generate_mccl_id()
+        dbg(f"_get_mccl_id: generated {mccl_id[:3]}...")
+        mccl_id_tsr = torch.tensor(mccl_id, device=device)
+    else:
+        mccl_id_tsr = torch.zeros(16, dtype=torch.int64, device=device)
+    dbg("_get_mccl_id: broadcasting...")
+    dist.broadcast(mccl_id_tsr, src=0)
+    dbg("_get_mccl_id: done")
+    return mccl_id_tsr.cpu().tolist()
+
 
 def div_up(x: int, y: int):
     return (x + y - 1) // y
@@ -25,13 +73,14 @@ def load_json(M: int, N: int, K: int):
     
     assert Path(file_path).exists(), "Please run preprocess.py first!"
     
-    # 如果文件存在，加载 JSON 数据
     with open(file_path, 'r', encoding='utf-8') as f:
         data = json.load(f)
     
     return data["BM"], data["BN"], data["dur"], data["Algo"]
 
 def save_solution(M: int, N: int, K: int, BM: int, BN: int, gemm_dur: float, Algo: int, hint: list, cSeg: list):
+    if _rank != 0:
+        return
     device = torch.musa.current_device()
     props = torch.musa.get_device_properties(device)
     gpu_name = props.name[7:11].lower()
@@ -64,51 +113,53 @@ def generate_row_remap_array(
         chunk_size = S * BM
         chunk_row_ids = original_row_ids[current_row : current_row + chunk_size]
         
-        # Compute row_id % world_size for the current chunk
         mod_values = chunk_row_ids % world_size
-        
-        # Sort the chunk based on mod_values (stable sort)
         _, sorted_indices = torch.sort(mod_values, stable=True)
         reordered_chunk = chunk_row_ids[sorted_indices]
         
         reordered_row_id[current_row : current_row + chunk_size] = reordered_chunk
         current_row += chunk_size
     
-    # Compute remap: remap[original_row_id] = new_row_id
     remap = torch.empty_like(original_row_ids)
     remap[reordered_row_id] = torch.arange(len(reordered_row_id), dtype=torch.int, device=device)
     
     return remap
 
-def compute_hint_process(rank, world_size, mccl_id,
-    M: int, N: int, K: int,
-    BM: int, BN: int, Algo: list, wSize: int, comm_op: str, 
-    result_dict):
+
+def compute_hint(M: int, N: int, K: int,
+    BM: int, BN: int, Algo: list, wSize: int, comm_op: str):
+    """Each rank runs the hint computation; result broadcast from rank 0."""
+    dbg(f"compute_hint: enter BM={BM} BN={BN} Algo={Algo} wSize={wSize}")
+    rank, world_size = _rank, _world_size
 
     TileNum = div_up(M, BM) * div_up(N, BN)
-    WaveNum = div_up(TileNum, wSize) 
+    WaveNum = div_up(TileNum, wSize)
+    dbg(f"compute_hint: TileNum={TileNum} WaveNum={WaveNum}")
 
     cSeg = []
     for i in range(WaveNum):
         this_seg = min(wSize, TileNum - i * wSize)
-        cSeg = cSeg + [this_seg]
+        cSeg.append(this_seg)
 
-    cSeg_CPU = torch.tensor(cSeg, dtype=torch.int32) 
+    cSeg_CPU = torch.tensor(cSeg, dtype=torch.int32)
     cSeg_GPU = cSeg_CPU.musa(rank)
 
-    torch.musa.set_device(rank)
-
+    mccl_id = _get_mccl_id()
+    dbg("compute_hint: creating OverlapImpl")
     gemm_class = torch.classes.flashoverlap_class.OverlapImpl()
-
+    dbg("compute_hint: mccl_init")
     gemm_class.mccl_init(rank, world_size, mccl_id)
+    dbg("compute_hint: mutlass_init")
     gemm_class.mutlass_init()
+    dbg("compute_hint: overlap_init")
     gemm_class.overlap_init()
+    dbg("compute_hint: init done")
 
     A = torch.empty((M, K), dtype=torch.float16, device="musa").normal_(mean=0., std=0.5)
     B = torch.empty((N, K), dtype=torch.float16, device="musa").normal_(mean=0., std=0.5)
     C = torch.empty((M, N), dtype=torch.float16, device="musa")
 
-    MonitoredMatrix = torch.zeros(((M+BM-1)//BM + 1, (N+BN-1)//BN), dtype=torch.int, device="musa") # TODO: We should put it in class
+    MonitoredMatrix = torch.zeros(((M+BM-1)//BM + 1, (N+BN-1)//BN), dtype=torch.int, device="musa")
     ReorderedArray = torch.arange(0, TileNum, dtype=torch.int, device="musa").reshape(((M+BM-1)//BM, (N+BN-1)//BN))
 
     if comm_op == "reduce_scatter":
@@ -116,87 +167,142 @@ def compute_hint_process(rank, world_size, mccl_id,
         RowArray = generate_row_remap_array(M, N, BM, BN, cSeg, world_size)
 
     _warm_up = 100
-    _sample = 10
+    _sample = 20
 
-    if comm_op == "all_reduce":
-        for _ in range(_warm_up):
-            gemm_class.gemm_allreduce_overlap(A, B, C, MonitoredMatrix, ReorderedArray, 1, cSeg_CPU, cSeg_GPU, Algo, True)
-        
-        samples = torch.empty((_sample, TileNum), dtype=torch.int, device="musa")
-        for i in range(_sample):
-            MonitoredMatrix[0] = 0
-            gemm_class.gemm_allreduce_overlap(A, B, C, MonitoredMatrix, ReorderedArray, 1, cSeg_CPU, cSeg_GPU, Algo, True)
-            samples[i, :] = MonitoredMatrix[1:, :].view(-1)
-    
-    elif comm_op == "reduce_scatter":
-        for _ in range(_warm_up):
-            gemm_class.gemm_reducescatter_overlap(A, B, C, D, MonitoredMatrix, ReorderedArray, RowArray, 1, cSeg_CPU, cSeg_GPU, Algo, True)
-        
-        samples = torch.empty((_sample, TileNum), dtype=torch.int, device="musa")
-        for i in range(_sample):
-            MonitoredMatrix[0] = 0
-            gemm_class.gemm_reducescatter_overlap(A, B, C, D, MonitoredMatrix, ReorderedArray, RowArray, 1, cSeg_CPU, cSeg_GPU, Algo, True)
-            samples[i, :] = MonitoredMatrix[1:, :].view(-1)
+    kernel_error = False
+    try:
+        if comm_op == "all_reduce":
+            dbg(f"compute_hint: warmup {_warm_up} iters...")
+            for wi in range(_warm_up):
+                gemm_class.gemm_allreduce_overlap(A, B, C, MonitoredMatrix, ReorderedArray, 1, cSeg_CPU, cSeg_GPU, Algo, True)
+            torch.musa.synchronize()
+            dbg("compute_hint: warmup done, sampling...")
 
-    else:
-        assert comm_op in ["all_reduce", "reduce_scatter"], \
-            f"comm_op must be 'all_reduce' or 'reduce_scatter', but got '{comm_op}'"
+            samples = torch.empty((_sample, TileNum), dtype=torch.int, device="musa")
+            for i in range(_sample):
+                MonitoredMatrix[0] = 0
+                gemm_class.gemm_allreduce_overlap(A, B, C, MonitoredMatrix, ReorderedArray, 1, cSeg_CPU, cSeg_GPU, Algo, True)
+                samples[i, :] = MonitoredMatrix[1:, :].view(-1)
+            torch.musa.synchronize()
+            dbg("compute_hint: sampling done")
 
+        elif comm_op == "reduce_scatter":
+            for _ in range(_warm_up):
+                gemm_class.gemm_reducescatter_overlap(A, B, C, D, MonitoredMatrix, ReorderedArray, RowArray, 1, cSeg_CPU, cSeg_GPU, Algo, True)
+            torch.musa.synchronize()
+
+            samples = torch.empty((_sample, TileNum), dtype=torch.int, device="musa")
+            for i in range(_sample):
+                MonitoredMatrix[0] = 0
+                gemm_class.gemm_reducescatter_overlap(A, B, C, D, MonitoredMatrix, ReorderedArray, RowArray, 1, cSeg_CPU, cSeg_GPU, Algo, True)
+                samples[i, :] = MonitoredMatrix[1:, :].view(-1)
+            torch.musa.synchronize()
+
+        else:
+            assert comm_op in ["all_reduce", "reduce_scatter"], \
+                f"comm_op must be 'all_reduce' or 'reduce_scatter', but got '{comm_op}'"
+    except RuntimeError as e:
+        dbg(f"compute_hint: kernel error during warmup/sampling: {e}")
+        kernel_error = True
+
+    # Analysis: either skip (kernel error) or perform majority-vote per tile
     hint = []
-    is_consistency = True
-    for w in range(WaveNum):
-        index = torch.where(((samples >= w * wSize) * (samples < (w + 1) * wSize)).sum(dim=0) == 10)
+    is_consistency = False
+    if not kernel_error:
+        # Move samples to CPU for analysis (avoids MUSA async error issues)
+        samples_cpu = samples.cpu()
 
-        if w < WaveNum - 1:
-            if index[0].shape[0] < wSize:
+        # Per-tile majority vote: assign each tile to its most frequent wave
+        tile_wave = samples_cpu // wSize  # shape: (_sample, TileNum), values 0..WaveNum-1
+        tile_wave = tile_wave.clamp(max=WaveNum - 1)
+
+        # For each tile, find the mode (most common wave across samples)
+        tile_modes = torch.mode(tile_wave, dim=0).values  # shape: (TileNum,)
+
+        # Compute confidence: how many samples agreed on the mode for each tile
+        mode_counts = torch.zeros(TileNum, dtype=torch.long)
+        for ti in range(TileNum):
+            mode_counts[ti] = (tile_wave[:, ti] == tile_modes[ti]).sum()
+
+        # Build per-wave tile lists, sorted by confidence (descending)
+        wave_tiles = {w: [] for w in range(WaveNum)}
+        for ti in range(TileNum):
+            wave_tiles[tile_modes[ti].item()].append((mode_counts[ti].item(), ti))
+        for w in wave_tiles:
+            wave_tiles[w].sort(reverse=True)
+
+        # Redistribute: assign exactly the target count per wave,
+        # keeping the most confident tiles, moving surplus to unassigned pool
+        unassigned = []
+        assigned = {w: [] for w in range(WaveNum)}
+        for w in range(WaveNum):
+            target = wSize if w < WaveNum - 1 else TileNum - w * wSize
+            tiles = wave_tiles[w]
+            assigned[w] = [t[1] for t in tiles[:target]]
+            unassigned.extend([t[1] for t in tiles[target:]])
+
+        # Fill waves that are still short from unassigned tiles
+        redistributed = 0
+        for w in range(WaveNum):
+            target = wSize if w < WaveNum - 1 else TileNum - w * wSize
+            while len(assigned[w]) < target and unassigned:
+                assigned[w].append(unassigned.pop())
+                redistributed += 1
+
+        # Build hint from assigned tiles
+        is_consistency = True
+        for w in range(WaveNum):
+            target = wSize if w < WaveNum - 1 else TileNum - w * wSize
+            if len(assigned[w]) < target:
+                dbg(f"compute_hint: wave {w}/{WaveNum} FAIL: need {target}, got {len(assigned[w])}")
                 is_consistency = False
                 break
+            dbg(f"compute_hint: wave {w}/{WaveNum} OK: {len(assigned[w])} tiles")
+            hint.extend(assigned[w])
 
-        hint = hint + index[0].tolist()
-        
-    result_dict[rank] = (is_consistency, hint)
+        dbg(f"compute_hint: redistributed {redistributed}/{TileNum} tiles")
 
-def compute_hint(M: int, N: int, K: int,
-    BM: int, BN: int, Algo: list, wSize: int, comm_op: str):
-    world_size = torch.musa.device_count()
-    if world_size < 2:
-        raise RuntimeError("At least 2 GPUs are required for this program.")
+    dbg(f"compute_hint: kernel_error={kernel_error} is_consistency={is_consistency} hint_len={len(hint)}")
+    # Broadcast result from rank 0 to all ranks so every rank agrees
+    consistency_tsr = torch.tensor([int(is_consistency)], dtype=torch.int64, device="musa")
+    dbg("compute_hint: broadcasting consistency...")
+    dist.broadcast(consistency_tsr, src=0)
+    is_consistency = bool(consistency_tsr.item())
+    dbg(f"compute_hint: consistency broadcast done, is_consistency={is_consistency}")
 
-    mccl_id = torch.ops.flashoverlap_op.generate_mccl_id()
-    torch.musa.synchronize()
-    # print(f"MCCL ID generated: {mccl_id[0]}")
+    if is_consistency:
+        if rank == 0:
+            hint_tsr = torch.tensor(hint, dtype=torch.int64, device="musa")
+            hint_len_tsr = torch.tensor([len(hint)], dtype=torch.int64, device="musa")
+        else:
+            hint_len_tsr = torch.zeros(1, dtype=torch.int64, device="musa")
+        dist.broadcast(hint_len_tsr, src=0)
+        hint_len = hint_len_tsr.item()
+        if rank != 0:
+            hint_tsr = torch.zeros(hint_len, dtype=torch.int64, device="musa")
+        dist.broadcast(hint_tsr, src=0)
+        hint = hint_tsr.cpu().tolist()
 
-    manager = mp.Manager()
-    result_dict = manager.dict()
+    dbg("compute_hint: final barrier...")
+    dist.barrier()
+    dbg("compute_hint: done")
+    return (is_consistency, hint)
 
-    mp.spawn(
-            compute_hint_process,
-            args=(world_size, mccl_id, M, N, K, BM, BN, Algo, wSize, comm_op, result_dict),
-            nprocs=world_size
-        )
-
-    return result_dict[0]
 
 def interpolate_latency(samples, x, comm_op):
-    world_size = torch.musa.device_count()
-    # 确保输入是 PyTorch 张量
+    world_size = _world_size
     if not isinstance(samples, torch.Tensor):
         samples = torch.tensor(samples, dtype=torch.float32)
     if not isinstance(x, torch.Tensor):
         x = torch.tensor(x, dtype=torch.float32)
 
-    # 将数据转换为 NumPy 数组
-    data_sizes = samples[:, 0].numpy()  # 数据量
-    bandwidths = samples[:, 1].numpy()  # 带宽
-    x_np = x.numpy()  # 需要插值的数据量
+    data_sizes = samples[:, 0].numpy()
+    bandwidths = samples[:, 1].numpy()
+    x_np = x.numpy()
 
-    # 使用 NumPy 的 interp 函数进行线性插值
     y_np = np.interp(x_np, data_sizes, bandwidths)
-
-    # 将结果转换回 PyTorch 张量
     y = torch.tensor(y_np, dtype=torch.float32).item()
 
-    # 使用 torch.interp 进行线性插值
     if comm_op == "all_reduce":
         latency = x * 2 * 2 * (world_size - 1) / y / (1024 ** 3)
     elif comm_op == "reduce_scatter":
@@ -235,41 +341,38 @@ def predict_lat(M: int, N: int, gemm_dur: float,
     return acc_comm_dur
 
 def reorder_indices(S, hint):
-    # Generate the original array of indices [0, 1, ..., S-1]
     original = list(range(S))
-    
-    # Create an empty list to store the new order of indices
     new_order = [-1] * S
-    
-    # Place the indices of the hint list in the first positions of the new order
     for i, element in enumerate(hint):
         new_order[element] = i
-    
-    # Place the remaining indices in the new order
     remaining_elements = [x for x in original if x not in hint]
     for i, element in enumerate(remaining_elements, start=len(hint)):
         new_order[element] = i
-    
     return torch.tensor(new_order, dtype=torch.int, device="musa")
 
-def perf_running_process(rank, world_size, mccl_id,
-    M: int, N: int, K: int,
-    BM: int, BN: int, Algo: int, cSeg: list, hint: list, 
-    comm_op: str,
-    result_dict):
 
-    cSeg_CPU = torch.tensor(cSeg, dtype=torch.int32) 
+def perf_running(M: int, N: int, K: int, 
+    BM: int, BN: int, Algo: int, 
+    cSeg: list, hint: list, comm_op: str):
+    """Each rank runs the benchmark; returns max duration across all ranks."""
+    dbg(f"perf_running: enter cSeg={cSeg}")
+    rank, world_size = _rank, _world_size
+
+    cSeg_CPU = torch.tensor(cSeg, dtype=torch.int32)
     cSeg_GPU = cSeg_CPU.musa(rank)
 
-    TileNum = div_up(M, BM) * div_up(N, BN) 
+    TileNum = div_up(M, BM) * div_up(N, BN)
 
-    torch.musa.set_device(rank)
-
+    mccl_id = _get_mccl_id()
+    dbg("perf_running: creating OverlapImpl")
     gemm_class = torch.classes.flashoverlap_class.OverlapImpl()
-
+    dbg("perf_running: mccl_init")
     gemm_class.mccl_init(rank, world_size, mccl_id)
+    dbg("perf_running: mutlass_init")
     gemm_class.mutlass_init()
+    dbg("perf_running: overlap_init")
     gemm_class.overlap_init()
+    dbg("perf_running: init done")
 
     A = torch.empty((M, K), dtype=torch.float16, device="musa").normal_(mean=0., std=0.5)
     B = torch.empty((N, K), dtype=torch.float16, device="musa").normal_(mean=0., std=0.5)
@@ -345,33 +448,13 @@ def perf_running_process(rank, world_size, mccl_id,
         else:
             dur = torch.zeros((_freq))
 
-    result_dict[rank] = torch.mean(dur).item()
-    
-def perf_running(M: int, N: int, K: int, 
-    BM: int, BN: int, Algo: int, 
-    cSeg: list, hint: list, comm_op: str):
-    world_size = torch.musa.device_count()
-    if world_size < 2:
-        raise RuntimeError("At least 2 GPUs are required for this program.")
+    local_dur = torch.mean(dur).item()
 
-    mccl_id = torch.ops.flashoverlap_op.generate_mccl_id()
-    torch.musa.synchronize()
-    # print(f"MCCL ID generated: {mccl_id[0]}")
+    # Get max duration across all ranks
+    dur_tensor = torch.tensor([local_dur], dtype=torch.float64, device="musa")
+    dist.all_reduce(dur_tensor, op=dist.ReduceOp.MAX)
+    return dur_tensor.item()
 
-    manager = mp.Manager()
-    result_dict = manager.dict()
-
-    mp.spawn(
-            perf_running_process,
-            args=(world_size, mccl_id, M, N, K, BM, BN, Algo, cSeg, hint, comm_op, result_dict),
-            nprocs=world_size
-        )
-
-    dur = torch.empty((world_size))
-    for i in range(world_size):
-        dur[i] = result_dict[i]
-
-    return dur.max()
 
 def integer_partitions(n):
     result = []
@@ -385,16 +468,14 @@ def integer_partitions(n):
     return result
 
 def exhaustive_search(M: int, N: int, K: int, comm_op: str):
-    # load the .json file
     BM_list, BN_list, gemm_dur_list, Algo_list = load_json(M, N, K)
 
-    # get the SM count
     device = torch.musa.current_device()
     props = torch.musa.get_device_properties(device)
     sm_count = props.multi_processor_count
 
     hint = None
-    for t in range(5):
+    for t in range(min(5, len(BM_list))):
         BM = BM_list[t]
         BN = BN_list[t]
         gemm_dur = gemm_dur_list[t]
@@ -403,7 +484,6 @@ def exhaustive_search(M: int, N: int, K: int, comm_op: str):
         tile_num = div_up(M, BM) * div_up(N, BN)
         wave_num = div_up(tile_num, (sm_count - 2))
 
-        #compute hint
         result = compute_hint(M, N, K, BM, BN, Algo, (sm_count - 2), comm_op)
 
         if result[0] == True:
@@ -411,7 +491,8 @@ def exhaustive_search(M: int, N: int, K: int, comm_op: str):
             break
 
     assert hint != None, "Tuning fails! Try to increase min_group_size manully."
-    print("Start exhaustive searching.")
+    if _rank == 0:
+        print("Start exhaustive searching.")
 
     min_dur = 1e5
 
@@ -428,28 +509,31 @@ def exhaustive_search(M: int, N: int, K: int, comm_op: str):
             else:
                 gp[j] = min(gp[j] * (sm_count - 2), tile_num - acc)
         dur = perf_running(M, N, K, BM, BN, Algo, gp, hint, comm_op)
-        print(gp, "%.4f" % (dur))
+        if _rank == 0:
+            print(gp, "%.4f" % (dur))
 
         if dur < min_dur:
             min_dur = dur
             cSeg = gp
         
-    print("Best solution: ", cSeg)
+    if _rank == 0:
+        print("Best solution: ", cSeg)
     save_solution(M, N, K, BM, BN, gemm_dur, Algo, hint, cSeg)
-    print("Solution saved.")
+    if _rank == 0:
+        print("Solution saved.")
 
 
 def fast_search(M: int, N: int, K: int, comm_array: torch.Tensor, comm_op: str):
-    # load the .json file
+    dbg(f"fast_search: enter M={M} N={N} K={K}")
     BM_list, BN_list, gemm_dur_list, Algo_list = load_json(M, N, K)
+    dbg(f"fast_search: loaded json, {len(BM_list)} configs")
 
-    # get the SM count
     device = torch.musa.current_device()
     props = torch.musa.get_device_properties(device)
     sm_count = props.multi_processor_count
 
     hint = None
-    for t in range(10):
+    for t in range(min(10, len(BM_list))):
         BM = BM_list[t]
         BN = BN_list[t]
         gemm_dur = gemm_dur_list[t]
@@ -460,15 +544,18 @@ def fast_search(M: int, N: int, K: int, comm_array: torch.Tensor, comm_op: str):
 
         min_group_size = div_up(wave_num, 10)
 
-        #compute hint
+        dbg(f"fast_search: try t={t} BM={BM} BN={BN} Algo={Algo} tile_num={tile_num} wave_num={wave_num} min_group_size={min_group_size}")
         result = compute_hint(M, N, K, BM, BN, Algo, min_group_size * (sm_count - 2), comm_op)
+        dbg(f"fast_search: compute_hint returned is_consistency={result[0]}")
 
         if result[0] == True:
             hint = result[1]
+            dbg(f"fast_search: found hint with {len(hint)} entries at t={t}")
             break
 
     assert hint != None, "Tuning fails! Try to increase min_group_size manully."
-    print("Start predictive searching.")
+    if _rank == 0:
+        print("Start predictive searching.")
     
     min_dur = 1e5
     normalized_wave_num = div_up(wave_num, min_group_size)
@@ -479,7 +566,6 @@ def fast_search(M: int, N: int, K: int, comm_array: torch.Tensor, comm_op: str):
         gp = group_size_list[i]
         iter_num = len(gp)
         acc = 0
-        # avoid cold start
         if iter_num > 5 and gp[0] > 2:
             continue
         for j in range(iter_num):
@@ -493,36 +579,40 @@ def fast_search(M: int, N: int, K: int, comm_array: torch.Tensor, comm_op: str):
         if est_dur < min_dur:
             min_dur = est_dur
             cSeg = gp
-    print("Search process finished.")
+    if _rank == 0:
+        print("Search process finished.")
 
+    dbg(f"fast_search: calling perf_running with cSeg={cSeg}")
     searched_lat = perf_running(M, N, K, BM, BN, Algo, cSeg, hint, comm_op)
-    print("Searched latency: %.4f" % searched_lat)
-    print("Best solution: ", cSeg)
+    dbg(f"fast_search: perf_running returned {searched_lat}")
+    if _rank == 0:
+        print("Searched latency: %.4f" % searched_lat)
+        print("Best solution: ", cSeg)
     save_solution(M, N, K, BM, BN, gemm_dur, Algo, hint, cSeg)
-    print("Solution saved.")
+    if _rank == 0:
+        print("Solution saved.")
 
 
-# Define the main function
 def main():
-    world_size = torch.musa.device_count()
+    init_dist()
 
-    # pass the problem size M, N, K via parser
     parser = argparse.ArgumentParser()
-    parser.add_argument('--m', type=int, default=4096)
-    parser.add_argument('--k', type=int, default=8192)
-    parser.add_argument('--n', type=int, default=8192)
+    parser.add_argument('--m_dim', type=int, default=4096)
+    parser.add_argument('--k_dim', type=int, default=8192)
+    parser.add_argument('--n_dim', type=int, default=8192)
     parser.add_argument('--comm_op', type=str, default='all_reduce')
-    parser.add_argument('--predictive_search', type=bool, default=False)
+    parser.add_argument('--predictive_search', action='store_true')
     args = parser.parse_args()
 
-    # Force to use predictive search if the workload is large
-    if args.predictive_search or args.m * args.n > 33554432:
-        comm_array = torch.load(f"../configs/bandwidth_{args.comm_op}_tp{world_size}.pt")
-        print("Bandwidth curve captured.")
-        fast_search(args.m, args.n, args.k, comm_array, args.comm_op)
+    if args.predictive_search or args.m_dim * args.n_dim > 33554432:
+        comm_array = torch.load(f"../configs/bandwidth_{args.comm_op}_tp{_world_size}.pt")
+        if _rank == 0:
+            print("Bandwidth curve captured.")
+        fast_search(args.m_dim, args.n_dim, args.k_dim, comm_array, args.comm_op)
     else:
-        # compute the optimal solution
-        exhaustive_search(args.m, args.n, args.k, args.comm_op)
+        exhaustive_search(args.m_dim, args.n_dim, args.k_dim, args.comm_op)
+
+    dist.destroy_process_group()
 
 if __name__ == "__main__":
     main()

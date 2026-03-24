@@ -1,21 +1,68 @@
-'''
-    Using multiprocessing for distributed running, 
-    please specify the GPUs via MUSA_VISIBLE_DEVICES:
-        MUSA_VISIBLE_DEVICES=0,1 python3 result.py --m 4096 --n 8192 --k 4096
-'''
+"""
+Speed test using torchrun distributed launch.
 
+Usage:
+    MUSA_VISIBLE_DEVICES=0,1 torchrun --nproc_per_node=2 test.py \
+        --m_dim 4096 --n_dim 4096 --k_dim 4096 --comm_op all_reduce
+"""
+
+import sys
 import torch
+import torch_musa
 import json
-from pathlib import Path
-import torch.multiprocessing as mp
-import pandas as pd
 import argparse
 import os
+import torch.distributed as dist
 
-torch.ops.load_library("../build/lib/libst_pybinding.so")
+def dbg(msg):
+    rank = os.getenv('LOCAL_RANK', '?')
+    print(f"[rank={rank}] {msg}", flush=True, file=sys.stderr)
 
-WARM_UP=20
-REP=200
+_script_dir = os.path.dirname(os.path.abspath(__file__))
+torch.ops.load_library(os.path.join(_script_dir, "../build/lib/libst_pybinding.so"))
+
+WARM_UP = 20
+REP = 200
+
+# Global distributed state
+_rank = 0
+_local_rank = 0
+_world_size = 1
+
+
+def init_dist():
+    """Initialize distributed using torchrun env vars."""
+    global _rank, _local_rank, _world_size
+    ip = os.getenv('MASTER_ADDR', '127.0.0.1')
+    port = int(os.getenv('MASTER_PORT', '29500'))
+    world_size = int(os.getenv('WORLD_SIZE', 1))
+    rank = int(os.getenv('RANK', 0))
+    local_rank = int(os.getenv('LOCAL_RANK', 0))
+
+    dist.init_process_group(
+        backend='mccl',
+        init_method=f'tcp://{ip}:{port}',
+        world_size=world_size,
+        rank=rank,
+    )
+    torch.musa.set_device(local_rank)
+
+    _rank = rank
+    _local_rank = local_rank
+    _world_size = world_size
+    dbg(f"init_dist done: rank={rank}, local_rank={local_rank}, world_size={world_size}")
+
+
+def _get_mccl_id():
+    """Generate MCCL ID on rank 0 and broadcast to all ranks."""
+    device = torch.device(f'musa:{_local_rank}')
+    if _rank == 0:
+        mccl_id = torch.ops.flashoverlap_op.generate_mccl_id()
+        mccl_id_tsr = torch.tensor(mccl_id, device=device)
+    else:
+        mccl_id_tsr = torch.zeros(16, dtype=torch.int64, device=device)
+    dist.broadcast(mccl_id_tsr, src=0)
+    return mccl_id_tsr.cpu().tolist()
 
 def div_up(x: int, y: int):
     return (x + y - 1) // y
@@ -68,21 +115,19 @@ def generate_row_remap_array(
     
     return remap
 
-def perf_running_process(rank, world_size, mccl_id,
-    M: int, N: int, K: int,
-    BM: int, BN: int, Algo: int, cSeg: list, hint: list, 
-    comm_op: str,
-    result_dict):
+def perf_running(M: int, N: int, K: int,
+    BM: int, BN: int, Algo: int, cSeg: list, hint: list,
+    comm_op: str):
+    """Run overlap perf benchmark on current rank, return max duration across ranks."""
+    rank, world_size = _rank, _world_size
 
-    cSeg_CPU = torch.tensor(cSeg, dtype=torch.int32) 
+    cSeg_CPU = torch.tensor(cSeg, dtype=torch.int32)
     cSeg_GPU = cSeg_CPU.musa(rank)
 
-    TileNum = div_up(M, BM) * div_up(N, BN) 
+    TileNum = div_up(M, BM) * div_up(N, BN)
 
-    torch.musa.set_device(rank)
-
+    mccl_id = _get_mccl_id()
     gemm_class = torch.classes.flashoverlap_class.OverlapImpl()
-
     gemm_class.mccl_init(rank, world_size, mccl_id)
     gemm_class.mutlass_init()
     gemm_class.overlap_init()
@@ -97,7 +142,7 @@ def perf_running_process(rank, world_size, mccl_id,
     if comm_op == "reduce_scatter":
         D = torch.empty((M // world_size, N), dtype=torch.float16, device="musa")
         RowArray = generate_row_remap_array(M, N, BM, BN, cSeg, world_size)
-    
+
     _warm_up = WARM_UP
     _freq = REP
 
@@ -106,9 +151,7 @@ def perf_running_process(rank, world_size, mccl_id,
         if comm_op == "all_reduce":
             for _ in range(_warm_up):
                 gemm_class.gemm_allreduce(A, B, C, Algo)
-
             gemm_class.gemm_allreduce(A, B, C, Algo)
-
             start_event = [torch.musa.Event(enable_timing=True) for i in range(_freq)]
             end_event = [torch.musa.Event(enable_timing=True) for i in range(_freq)]
             for i in range(_freq):
@@ -120,10 +163,8 @@ def perf_running_process(rank, world_size, mccl_id,
         elif comm_op == "reduce_scatter":
             for _ in range(_warm_up):
                 gemm_class.gemm_reducescatter(A, B, C, D, Algo)
-
             MonitoredMatrix[0] = 0
             gemm_class.gemm_reducescatter(A, B, C, D, Algo)
-
             start_event = [torch.musa.Event(enable_timing=True) for i in range(_freq)]
             end_event = [torch.musa.Event(enable_timing=True) for i in range(_freq)]
             for i in range(_freq):
@@ -132,12 +173,10 @@ def perf_running_process(rank, world_size, mccl_id,
                 end_event[i].record()
             torch.musa.synchronize()
             dur = torch.tensor([s.elapsed_time(e) for s, e in zip(start_event, end_event)], dtype=torch.float)
-
     else:
         if comm_op == "all_reduce":
             for _ in range(_warm_up):
                 gemm_class.gemm_allreduce_overlap(A, B, C, MonitoredMatrix, ReorderedArray, 1, cSeg_CPU, cSeg_GPU, Algo, False)
-
             start_event = [torch.musa.Event(enable_timing=True) for i in range(_freq)]
             end_event = [torch.musa.Event(enable_timing=True) for i in range(_freq)]
             for i in range(_freq):
@@ -149,7 +188,6 @@ def perf_running_process(rank, world_size, mccl_id,
         elif comm_op == "reduce_scatter":
             for _ in range(_warm_up):
                 gemm_class.gemm_reducescatter_overlap(A, B, C, D, MonitoredMatrix, ReorderedArray, RowArray, 1, cSeg_CPU, cSeg_GPU, Algo, False)
-
             start_event = [torch.musa.Event(enable_timing=True) for i in range(_freq)]
             end_event = [torch.musa.Event(enable_timing=True) for i in range(_freq)]
             for i in range(_freq):
@@ -161,40 +199,17 @@ def perf_running_process(rank, world_size, mccl_id,
         else:
             dur = torch.zeros((_freq))
 
-    result_dict[rank] = torch.mean(dur).item()
-    
-def perf_running(M: int, N: int, K: int, 
-    BM: int, BN: int, Algo: int, 
-    cSeg: list, hint: list, comm_op: str):
-    world_size = torch.musa.device_count()
-    if world_size < 2:
-        raise RuntimeError("At least 2 GPUs are required for this program.")
+    # Take max across all ranks
+    local_dur = torch.tensor([torch.mean(dur).item()], device="musa")
+    dist.all_reduce(local_dur, op=dist.ReduceOp.MAX)
+    return local_dur.item()
 
-    mccl_id = torch.ops.flashoverlap_op.generate_mccl_id()
-    torch.musa.synchronize()
-    # print(f"MCCL ID generated: {mccl_id[0]}")
+def perf_comm(M: int, N: int, comm_type: str):
+    """Benchmark communication on current rank, return rank-0 duration."""
+    rank, world_size = _rank, _world_size
 
-    manager = mp.Manager()
-    result_dict = manager.dict()
-
-    mp.spawn(
-            perf_running_process,
-            args=(world_size, mccl_id, M, N, K, BM, BN, Algo, cSeg, hint, comm_op, result_dict),
-            nprocs=world_size
-        )
-
-    dur = torch.empty((world_size))
-    for i in range(world_size):
-        dur[i] = result_dict[i]
-
-    return dur.max()
-
-# Function to initialize MCCL in each process
-def perf_comm_process(rank, world_size, mccl_id, M, N, comm_type, result_dict):
-    torch.musa.set_device(rank)
-
+    mccl_id = _get_mccl_id()
     comm_class = torch.classes.flashoverlap_class.OverlapImpl()
-
     comm_class.mccl_init(rank, world_size, mccl_id)
     comm_class.mutlass_init()
 
@@ -226,33 +241,15 @@ def perf_comm_process(rank, world_size, mccl_id, M, N, comm_type, result_dict):
         dur = torch.tensor([s.elapsed_time(e) for s, e in zip(start_event, end_event)], dtype=torch.float)
     else:
         dur = torch.zeros((REP))
-        
-    result_dict[rank] = torch.mean(dur).item()
 
-def perf_comm(M: int, N: int, comm_type: str):
-    world_size = torch.musa.device_count()
-    if world_size < 2:
-        raise RuntimeError("At least 2 GPUs are required!")
-    
-    mccl_id = torch.ops.flashoverlap_op.generate_mccl_id()
-    torch.musa.synchronize()
-    # print(f"MCCL ID generated: {mccl_id[0]}")
+    # Broadcast rank-0's result
+    local_dur = torch.tensor([torch.mean(dur).item()], device="musa")
+    dist.broadcast(local_dur, src=0)
+    return local_dur.item()
 
-    manager = mp.Manager()
-    result_dict = manager.dict()
-
-    # get the all reduce time
-    mp.spawn(
-            perf_comm_process,
-            args=(world_size, mccl_id, M, N, comm_type, result_dict),
-            nprocs=world_size
-        )
-
-    return result_dict[0]
-
-# Function to initialize MCCL in each process
-def perf_baseline_process(rank, world_size, mccl_id, M, N, K, comm_op, result_dict):
-    torch.musa.set_device(rank)
+def perf_baseline(M: int, N: int, K: int, comm_op: str):
+    """Run baseline (no overlap) perf benchmark on current rank, return max duration."""
+    rank, world_size = _rank, _world_size
 
     A = torch.empty((M, K), dtype=torch.float16, device="musa").normal_(mean=0., std=0.5)
     B = torch.empty((N, K), dtype=torch.float16, device="musa").normal_(mean=0., std=0.5)
@@ -261,7 +258,7 @@ def perf_baseline_process(rank, world_size, mccl_id, M, N, K, comm_op, result_di
     if comm_op == "reduce_scatter":
         D = torch.empty((M // world_size, N), dtype=torch.float16, device="musa")
 
-    # **** Init Baseline Class **** #
+    mccl_id = _get_mccl_id()
     gemm_comm = torch.classes.flashoverlap_class.BaselineImpl()
     gemm_comm.mccl_init(rank, world_size, mccl_id)
     gemm_comm.mublas_init()
@@ -273,9 +270,7 @@ def perf_baseline_process(rank, world_size, mccl_id, M, N, K, comm_op, result_di
         end_event = [torch.musa.Event(enable_timing=True) for i in range(REP)]
         for i in range(REP):
             start_event[i].record()
-            # torch.musa.musart().musaProfilerStart()
             gemm_comm.gemm_allreduce(A, B, C)
-            # torch.musa.musart().musaProfilerStop()
             end_event[i].record()
         torch.musa.synchronize()
         dur = torch.tensor([s.elapsed_time(e) for s, e in zip(start_event, end_event)], dtype=torch.float)
@@ -286,43 +281,21 @@ def perf_baseline_process(rank, world_size, mccl_id, M, N, K, comm_op, result_di
         end_event = [torch.musa.Event(enable_timing=True) for i in range(REP)]
         for i in range(REP):
             start_event[i].record()
-            # torch.musa.musart().musaProfilerStart()
             gemm_comm.gemm_reducescatter(A, B, C, D)
-            # torch.musa.musart().musaProfilerStop()
             end_event[i].record()
         torch.musa.synchronize()
         dur = torch.tensor([s.elapsed_time(e) for s, e in zip(start_event, end_event)], dtype=torch.float)
     else:
         dur = torch.zeros((REP))
-    
-    result_dict[rank] = torch.mean(dur).item()
 
-def perf_baseline(M: int, N: int, K: int, comm_op: str):
-    world_size = torch.musa.device_count()
-    if world_size < 2:
-        raise RuntimeError("At least 2 GPUs are required for this program.")
-    # Use the custom MCCL initialization wrapper to get a unique MCCL ID
-    # mccl_id = NcclInit()
-    mccl_id = torch.ops.flashoverlap_op.generate_mccl_id()
-    torch.musa.synchronize()
-
-    manager = mp.Manager()
-    result_dict = manager.dict()
-
-    # Spawn processes
-    mp.spawn(
-            perf_baseline_process,
-            args=(world_size, mccl_id, M, N, K, comm_op, result_dict),
-            nprocs=world_size
-        )
-    
-    dur = torch.empty((world_size))
-    for i in range(world_size):
-        dur[i] = result_dict[i]
-    
-    return dur.max()
+    # Take max across all ranks
+    local_dur = torch.tensor([torch.mean(dur).item()], device="musa")
+    dist.all_reduce(local_dur, op=dist.ReduceOp.MAX)
+    return local_dur.item()
 
 def main():
+    init_dist()
+
     device = torch.musa.current_device()
     props = torch.musa.get_device_properties(device)
     gpu_name = props.name[7:11].lower()
@@ -330,17 +303,17 @@ def main():
     wave_size = sm_count - 2
 
     parser = argparse.ArgumentParser()
-    parser.add_argument('--m', type=int, default=4096)
-    parser.add_argument('--k', type=int, default=8192)
-    parser.add_argument('--n', type=int, default=8192)
+    parser.add_argument('--m_dim', type=int, default=4096)
+    parser.add_argument('--k_dim', type=int, default=8192)
+    parser.add_argument('--n_dim', type=int, default=8192)
     parser.add_argument('--comm_op', type=str, default='all_reduce')
     args = parser.parse_args()
 
     comm_op = args.comm_op
 
-    m, n, k = args.m, args.n, args.k
+    m, n, k = args.m_dim, args.n_dim, args.k_dim
 
-    file_path = f'../configs/m{m}n{n}k{k}_{gpu_name}.json'
+    file_path = os.path.join(_script_dir, f'../configs/m{m}n{n}k{k}_{gpu_name}.json')
 
     with open(file_path, 'r', encoding='utf-8') as f:
         data = json.load(f)
@@ -349,26 +322,33 @@ def main():
     wave_num = (tile_num + wave_size - 1) // wave_size
 
     gemm_dur = data["dur"]
+
+    dbg("Starting comm benchmark...")
     comm_dur = perf_comm(m, n, comm_op)
-    overlap_dur = perf_running(m, n, k, 
+    dbg("Starting overlap benchmark...")
+    overlap_dur = perf_running(m, n, k,
         data["BM"], data["BN"], data["Algo"], data["cSeg"], data["hint"], comm_op)
+    dbg("Starting baseline benchmark...")
     baseline_dur = perf_baseline(m, n, k, comm_op)
 
     speedup = baseline_dur / overlap_dur
 
-    print(f"""
-        {'Item':<10} {'Value':>15}
-        {'-----':<10} {'-----':>15}
-        {'m':<10} {m:>15}
-        {'n':<10} {n:>15}
-        {'k':<10} {k:>15}
-        {'tile_num':<10} {tile_num:>15}
-        {'gemm_dur (ms)':<10} {gemm_dur:>15.4f}
-        {'comm_dur (ms)':<10} {comm_dur:>15.4f}
-        {'baseline_dur (ms)':<10} {baseline_dur:>15.4f}
-        {'overlap_dur (ms)':<10} {overlap_dur:>15.4f}
-        {'speedup':<10} {speedup:>15.4f}
+    if _rank == 0:
+        print(f"""
+        {'Item':<20} {'Value':>15}
+        {'-----':<20} {'-----':>15}
+        {'m':<20} {m:>15}
+        {'n':<20} {n:>15}
+        {'k':<20} {k:>15}
+        {'tile_num':<20} {tile_num:>15}
+        {'gemm_dur (ms)':<20} {gemm_dur:>15.4f}
+        {'comm_dur (ms)':<20} {comm_dur:>15.4f}
+        {'baseline_dur (ms)':<20} {baseline_dur:>15.4f}
+        {'overlap_dur (ms)':<20} {overlap_dur:>15.4f}
+        {'speedup':<20} {speedup:>15.4f}
         """)
+
+    dist.destroy_process_group()
 
 if __name__ == "__main__":
     main()
