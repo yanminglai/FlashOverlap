@@ -336,6 +336,8 @@ def main():
     parser.add_argument('--k_dim', type=int, default=8192)
     parser.add_argument('--n_dim', type=int, default=8192)
     parser.add_argument('--comm_op', type=str, default='all_reduce')
+    parser.add_argument('--single_seg', action='store_true',
+                        help='Force single segment (no overlap, MUTlass+bulk MCCL)')
     args = parser.parse_args()
 
     comm_op = args.comm_op
@@ -349,6 +351,10 @@ def main():
 
     tile_num = m // data["BM"] * n // data["BN"]
     wave_num = (tile_num + wave_size - 1) // wave_size
+
+    if args.single_seg:
+        data["cSeg"] = [tile_num]
+        data["hint"] = list(range(tile_num))
 
     mutlass_gemm_dur = data["dur"]
 
@@ -372,6 +378,8 @@ def main():
         {'n':<25} {n:>15}
         {'k':<25} {k:>15}
         {'tile_num':<25} {tile_num:>15}
+        {'cSeg':<25} {str(data["cSeg"]):>15}
+        {'num_segs':<25} {len(data["cSeg"]):>15}
         {'mutlass_gemm (ms)':<25} {mutlass_gemm_dur:>15.4f}
         {'mublas_gemm (ms)':<25} {mublas_gemm_dur:>15.4f}
         {'mccl_comm (ms)':<25} {mccl_comm_dur:>15.4f}
