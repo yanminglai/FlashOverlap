@@ -1,4 +1,5 @@
 import torch
+import torch_musa
 import json
 from pathlib import Path
 import pandas as pd
@@ -7,7 +8,8 @@ import os
 import time
 import torch.distributed as dist
 
-torch.ops.load_library("../build/lib/libst_pybinding.so")
+_script_dir = os.path.dirname(os.path.abspath(__file__))
+torch.ops.load_library(os.path.join(_script_dir, "../build/lib/libst_pybinding.so"))
 
 WARM_UP = 20
 REP = 200

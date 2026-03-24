@@ -1,4 +1,5 @@
 import torch
+import torch_musa
 import argparse
 import os
 import time
@@ -7,7 +8,8 @@ from pathlib import Path
 import matplotlib.pyplot as plt
 
 # Load custom ops library
-torch.ops.load_library("../build/lib/libst_pybinding.so")
+_script_dir = os.path.dirname(os.path.abspath(__file__))
+torch.ops.load_library(os.path.join(_script_dir, "../build/lib/libst_pybinding.so"))
 
 # Constants
 WARM_UP = 20

@@ -4,13 +4,15 @@
 '''
 
 import torch
+import torch_musa
 import argparse
 import pandas as pd
 import json
 import os
 from pathlib import Path
 
-torch.ops.load_library("../build/lib/libst_pybinding.so")
+_script_dir = os.path.dirname(os.path.abspath(__file__))
+torch.ops.load_library(os.path.join(_script_dir, "../build/lib/libst_pybinding.so"))
 
 def get_optimal(data, idx: int):
     data["Runtime"] = data["Runtime"].astype(float)

@@ -1,8 +1,11 @@
 import torch
+import torch_musa
 import torch.nn as nn
+import os
 from utils import reorder_indices, div_up
 
-torch.ops.load_library("../build/lib/libst_pybinding.so")
+_script_dir = os.path.dirname(os.path.abspath(__file__))
+torch.ops.load_library(os.path.join(_script_dir, "../build/lib/libst_pybinding.so"))
 
 class RMSNorm(torch.nn.Module):
     def __init__(self, dim: int, eps: float = 1e-5):

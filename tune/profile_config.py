@@ -4,6 +4,7 @@
 '''
 
 import torch
+import torch_musa
 import argparse
 import pandas as pd
 import json
@@ -11,7 +12,8 @@ import os
 from pathlib import Path
 from heapq import nsmallest
 
-torch.ops.load_library("../build/lib/libst_pybinding.so")
+_script_dir = os.path.dirname(os.path.abspath(__file__))
+torch.ops.load_library(os.path.join(_script_dir, "../build/lib/libst_pybinding.so"))
 
 def perf_wrapped_gemm(M: int, N: int, K: int, Algo: int):
     gemm_class = torch.classes.flashoverlap_class.OverlapImpl()

@@ -1,9 +1,12 @@
 import torch.nn as nn
 import torch
+import torch_musa
 import torch.distributed as dist
+import os
 from utils import reorder_indices, div_up, generate_row_mapping
 
-torch.ops.load_library("../build/lib/libst_pybinding.so")
+_script_dir = os.path.dirname(os.path.abspath(__file__))
+torch.ops.load_library(os.path.join(_script_dir, "../build/lib/libst_pybinding.so"))
 
 class RowParallelLayer(nn.Module):
     def __init__(self, in_features, out_features, comm_op, tp_group):

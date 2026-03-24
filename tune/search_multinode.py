@@ -1,13 +1,15 @@
 import torch
+import torch_musa
 import argparse
 import json
+import os
 from pathlib import Path
 import torch.distributed as dist
-import os
 import time
 import numpy as np
 
-torch.ops.load_library("../build/lib/libst_pybinding.so")
+_script_dir = os.path.dirname(os.path.abspath(__file__))
+torch.ops.load_library(os.path.join(_script_dir, "../build/lib/libst_pybinding.so"))
 
 def init_distributed():
     rank = int(os.environ['RANK'])
