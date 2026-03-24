@@ -22,17 +22,20 @@ FlashOverlap 的核心思想是将 GEMM 计算与集合通信（AllReduce / Redu
 
 ## 2. MCCL 带宽曲线
 
-使用 `bandwidth.py` 对 2 卡 allreduce 进行带宽测量（`bandwidth.png`）：
+使用 `bandwidth.py` 对 **8 卡 allreduce** 进行带宽测量（busbw = msgsize × 2(n-1)/n / time_sec）：
 
-| 数据量（elements） | 带宽（GB/s） | 特点 |
+> **注意**：早期版本 bandwidth.py 存在 busbw 公式 bug（缺少 ms→s 换算和 /world_size），导致显示值偏低约 2 个数量级。已于 2026-03-24 修复。
+
+| 数据量 | busbw（GB/s） | 特点 |
 |---|---|---|
-| < 5M (~10MB) | < 0.4 | **延迟主导区**，launch overhead 占比高 |
-| 5M ~ 50M | 0.4 → 1.2 | 逐步逼近链路饱和 |
-| > 100M (~200MB+) | ~1.3-1.4 | **带宽饱和区**，达到 2 卡间链路峰值 |
+| 1 MB | ~11 | **延迟主导区**，launch overhead 占比高 |
+| 4 ~ 16 MB | 50 → 120 | 逐步逼近链路饱和 |
+| 64 ~ 256 MB | 160 → 179 | **带宽饱和区** |
+| 256 MB+ | ~176-179 | 峰值平台 |
 
-**峰值有效带宽：~1.4 GB/s**（allreduce 算法带宽，物理单向约 0.7 GB/s）。
+**峰值 busbw：~179 GB/s**（8 卡 allreduce，256 MB 处达到）。
 
-**关键结论**：小数据量的 MCCL 效率极低。M=1024, N=1024 的矩阵只有 2MB（1M elements），在曲线最左侧，带宽仅 ~0.08 GB/s，离饱和差 17 倍。如果 overlap 再将其切成 5 段（每段 ~0.4MB），效率更差。
+**关键结论**：8 卡场景下 MCCL 带宽充足（峰值 ~179 GB/s），但小数据量（<4 MB）仍受延迟主导，busbw 仅 ~11-30 GB/s。M=1024, N=1024 的矩阵只有 2MB（1M elements × fp16），overlap 分段后每段可能不足 1 MB，处于低效区。
 
 ---
 
@@ -132,7 +135,23 @@ overlap (mutlass+mccl)             1.6554
 speedup                            0.8840
 ```
 
-#### 三组对比分析
+### 4.3 8 卡验证：M=N=1024, K=40960（tile_num=64）
+
+将卡数从 2 扩展到 8，使用修正后的 bandwidth / search 公式重新搜索 cSeg。
+
+```
+8 卡 allreduce, cSeg=[54, 10], num_segs=2
+mutlass_gemm (ms)                  1.1048
+mublas_gemm (ms)                   1.1530
+mccl_comm (ms)                     0.3193
+baseline (mublas+mccl)             1.4635
+overlap (mutlass+mccl)             1.9788
+speedup                            0.7396
+```
+
+**分析**：8 卡场景的通信时间（0.3193ms）与 2 卡（0.3192ms）几乎一致，说明 allreduce busbw 在小数据量下差异不大。MUTlass GEMM 也无变化（tile_num=64 不受卡数影响）。最终 speedup（0.7396）与 2 卡（0.7390）基本持平——**瓶颈仍是 OverlapImpl 固定开销 + 分段通信损失，而非通信量不足**。
+
+#### 三组对比分析（2 卡数据）
 
 | 模式 | GEMM | MCCL | 实际耗时 | speedup |
 |------|------|------|---------|---------|
@@ -183,7 +202,7 @@ MUTlass 在 tile_num > 1 wave 时 GEMM 性能急剧恶化（2.5-4× 慢于 muBLA
 
 ### 瓶颈 2：小数据量的 MCCL 分段通信效率
 
-2 卡间 MCCL allreduce 在小数据量（<10MB）时带宽利用率极低（<0.4 GB/s vs 峰值 1.4 GB/s）。overlap 分段进一步恶化了这个问题。
+8 卡 MCCL allreduce 在小数据量（<4MB）时 busbw 仅 ~11-30 GB/s（vs 峰值 ~179 GB/s）。overlap 分段进一步恶化了这个问题。不过 8 卡实测表明，对于 M=N=1024 的场景，通信时间本身就很短（~0.32ms），即使带宽充足也只能隐藏这么多——远小于 OverlapImpl 固定开销（~0.23ms）+ 分段损失（~0.32ms）的总和。
 
 ### 瓶颈 3：OverlapImpl 固定开销
 
@@ -203,15 +222,11 @@ MUTlass 在 tile_num > 1 wave 时 GEMM 性能急剧恶化（2.5-4× 慢于 muBLA
 - **Warp 级优化**：检查 shared memory bank conflict、寄存器压力、pipeline 指令调度。
 - **Persistent kernel**：使用 persistent thread block 模式避免反复 launch 的开销（CUTLASS 3.x grouped GEMM 思路）。
 
-### 方向 B：多卡扩展测试
+### 方向 B：增大矩阵规模测试（已验证 8 卡无效）
 
-当前只测了 2 卡。8 卡场景下通信量更大（allreduce 数据量不变，但 ring 步数更多），通信时间会显著增长，overlap 的**收益空间**更大。即使 MUTlass 慢一些，如果通信占比够高，仍可能获得加速。
+**已完成**：8 卡 allreduce（M=N=1024, K=40960）实测 speedup=0.7396，与 2 卡持平。原因：allreduce 数据量由矩阵 M×N 决定（与卡数无关），小矩阵下通信时间本身就短，卡数增多不改变这一点。
 
-**建议测试**：
-```bash
-MUSA_VISIBLE_DEVICES=0,1,2,3,4,5,6,7 torchrun --nproc_per_node=8 \
-    test/test.py --m_dim 4096 --n_dim 4096 --k_dim 4096 --comm_op all_reduce
-```
+**仍有价值的方向**：增大 M 或 N 维度（如 M=4096, N=4096），使通信量足够大（32MB+），通信时间显著增长后 overlap 才有隐藏空间。但这会导致 tile_num 远超 1 wave，MUTlass 性能恶化（回到瓶颈 1）——这正是核心矛盾。
 
 ### 方向 C：降低 OverlapImpl 固定开销
 
@@ -231,14 +246,14 @@ MUSA_VISIBLE_DEVICES=0,1,2,3,4,5,6,7 torchrun --nproc_per_node=8 \
 
 ---
 
-## 7. 优先级建议
+## 7. 优先级建议（更新：8 卡测试已完成）
 
 | 优先级 | 方向 | 理由 |
 |--------|------|------|
-| **P0** | B - 8 卡测试 | 成本最低，只需运行测试，可能直接验证可行性 |
-| **P1** | A - MUTlass GEMM 优化 | 根本解决方案，但工程量大 |
-| **P2** | D - muBLAS 粗粒度 overlap | 绕过 MUTlass 瓶颈的 workaround |
-| **P3** | C - OverlapImpl 开销优化 | 影响相对小，优先级低 |
+| **P0** | A - MUTlass GEMM 优化 | 根本解决方案：tile_num > 1 wave 时 ratio 要降到 ≤ 1.3 |
+| **P1** | D - muBLAS 粗粒度 overlap | 绕过 MUTlass 瓶颈的 workaround，工程可控 |
+| **P2** | C - OverlapImpl 开销优化 | 0.23ms 固定开销在短通信下影响大 |
+| ~~P3~~ | ~~B - 8 卡测试~~ | ✅ 已完成，验证结论：小矩阵下卡数增多不改变瓶颈 |
 
 ---
 

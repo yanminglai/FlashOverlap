@@ -126,13 +126,16 @@ def main():
 
         if rank == 0:
             data_size_bytes = size * 2  # float16 = 2 bytes
+            avg_time_s = avg_time / 1000  # ms -> s
             if args.comm_op == "all_reduce":
-                total_data_transferred = data_size_bytes * 2 * (world_size - 1)
+                # standard busbw = msgsize * 2*(n-1)/n / time
+                busbw = data_size_bytes * 2 * (world_size - 1) / world_size / avg_time_s / (1024 ** 3)
             else:  # reduce_scatter
-                total_data_transferred = data_size_bytes * (world_size - 1)
+                # standard busbw = msgsize * (n-1)/n / time
+                busbw = data_size_bytes * (world_size - 1) / world_size / avg_time_s / (1024 ** 3)
 
-            bandwidth = (total_data_transferred / avg_time) / (1024 ** 3)
-            print(f"Size: {size / 2**20:.1f} MB, Bandwidth: {bandwidth:.2f} GB/s")
+            bandwidth = busbw
+            print(f"Size: {size / 2**20:.1f} MB, busbw: {busbw:.2f} GB/s")
             bandwidths.append(bandwidth)
             comm_array[i, 0] = size
             comm_array[i, 1] = bandwidth
