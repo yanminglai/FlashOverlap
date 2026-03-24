@@ -121,8 +121,6 @@ def main():
     comm_array = torch.zeros((len(data_sizes), 2))
 
     for i, size in enumerate(data_sizes):
-        if rank == 0:
-            print(f"Testing size: {size / 2**20:.1f} MB")
 
         avg_time = perf_comm(1024, size // 1024, args.comm_op, comm_class)
 
@@ -134,6 +132,7 @@ def main():
                 total_data_transferred = data_size_bytes * (world_size - 1)
 
             bandwidth = (total_data_transferred / avg_time) / (1024 ** 3)
+            print(f"Size: {size / 2**20:.1f} MB, Bandwidth: {bandwidth:.2f} GB/s")
             bandwidths.append(bandwidth)
             comm_array[i, 0] = size
             comm_array[i, 1] = bandwidth
